@@ -7,8 +7,10 @@ import { hashPassword, verifyPassword } from '../src/admin/password.js';
 import { createAdminServer } from '../src/admin/server.js';
 import { createAlerter } from '../src/alerts.js';
 import { loadSettings } from '../src/config.js';
-import { getAdminPassword, getAlertSettings, getAlertState, saveAlertSettings } from '../src/db/store.js';
+import { getAdminPassword, getAlertSettings, getAlertState, getScheduleSettings, saveAlertSettings, saveScheduleSettings } from '../src/db/store.js';
 import { executeRun } from '../src/engine/run.js';
+import { effectiveSchedule } from '../src/schedule.js';
+import { startScheduler } from '../src/scheduler.js';
 import { addQuoteFamily, makeHarness, T } from './helpers.js';
 
 const SECRETS = {
@@ -25,7 +27,7 @@ after(async () => {
   for (const admin of openServers) await admin.close().catch(() => {});
 });
 
-async function startAdmin(h, { env = {}, fetchImpl, now } = {}) {
+async function startAdmin(h, { env = {}, fetchImpl, now, runs = null } = {}) {
   const settings = loadSettings({ ...SECRETS, ALERT_EMAIL_FROM: 'alerts@patchops.example', ...env });
   const sent = [];
   const alerter = createAlerter(settings.alerts, {
@@ -34,7 +36,7 @@ async function startAdmin(h, { env = {}, fetchImpl, now } = {}) {
       return new Response(JSON.stringify({ id: 'email_123' }), { status: 200 });
     }),
   });
-  const admin = createAdminServer({ db: h.db, settings, alerter, logger: h.ctx().logger, now });
+  const admin = createAdminServer({ db: h.db, settings, alerter, logger: h.ctx().logger, now, runs });
   openServers.add(admin);
   const address = await admin.listen(0, '127.0.0.1');
   const base = `http://127.0.0.1:${address.port}`;
@@ -81,6 +83,7 @@ test('admin: nothing but the health check, the page assets and the sign-in page 
     '/assets/admin.css': 'text/css; charset=utf-8',
     '/assets/logo.svg': 'image/svg+xml',
     '/assets/gear.svg': 'image/svg+xml',
+    '/assets/chevron.svg': 'image/svg+xml',
     '/assets/favicon.png': 'image/png',
     '/assets/apple-touch-icon.png': 'image/png',
     '/assets/montserrat-latin.woff2': 'font/woff2',
@@ -384,7 +387,7 @@ test('admin: the page shows the last run status and never contains a secret, eve
   assert.match(page.text, /<td>Lines to header<\/td><td class="num" data-label="Checked">3<\/td><td class="num" data-label="Would fill">2<\/td><td class="num" data-label="No match">1<\/td><td class="num" data-label="Held for review">0<\/td><td class="num" data-label="Failed">0<\/td>/);
   assert.match(page.text, /Would fill/);
   assert.match(page.text, /<p class="stat-label">Held for review<\/p>\n<p class="stat-value">0<\/p>/);
-  assert.match(page.text, /Live: scheduled runs write to HubSpot/);
+  assert.match(page.text, /Live: runs write to HubSpot/);
   assert.match(page.text, /Every 30 minutes/);
 
   fake.advance(30);
@@ -439,7 +442,7 @@ test('admin: the page shows the last run status and never contains a secret, eve
   await h.cleanup();
 });
 
-test('admin: nothing on the page can write to HubSpot', async () => {
+test('admin: the admin code cannot reach HubSpot itself; without the run control the page cannot start a run', async () => {
   const h = await makeHarness();
   const { fake } = h;
   addQuoteFamily(fake, { quote: 'Q1', customer: 'C1', contactNumber: '1' });
@@ -454,10 +457,10 @@ test('admin: nothing on the page can write to HubSpot', async () => {
     assert.equal((await a.request('POST', url, { cookie, form: { csrf, apply: '1', dry_run: 'false' } })).status, 404, url);
     assert.equal((await a.request('GET', url, { cookie })).status, 404, url);
   }
-  assert.equal(fake.requests.length, 0, 'the admin page never calls HubSpot');
+  assert.equal(fake.requests.length, 0, 'the admin page itself never calls HubSpot');
   assert.equal(await h.count('runs'), 0);
 
-  // The page has exactly four forms, and none of them is about runs or mappings.
+  // Without the run control the page has exactly four forms, and none of them is about runs or mappings.
   const page = await a.request('GET', '/', { cookie });
   const actions = [...page.text.matchAll(/<form method="post" action="([^"]+)"/g)].map((m) => m[1]).sort();
   assert.deepEqual(actions, ['/alerts', '/alerts/test', '/logout', '/password']);
@@ -716,6 +719,305 @@ test('admin password: wrong current passwords count towards the sign-in lock', a
   clock += 16 * 60_000;
   assert.equal((await a.request('POST', '/password', { cookie, form: { ...form, current_password: SECRETS.ADMIN_PASSWORD } })).status, 303);
   assert.equal(await h.count('admin_password'), 1);
+  await a.close();
+  await h.cleanup();
+});
+
+// ---- Sync now and the schedule -------------------------------------------------
+
+const tick = () => new Promise((r) => setImmediate(r));
+
+async function untilIdle(scheduler) {
+  const deadline = Date.now() + 20_000;
+  while (scheduler.status().running) {
+    if (Date.now() > deadline) throw new Error('the run did not finish');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** A scheduler like the service's, with timers that never fire by themselves and runs that can be held open. */
+function testScheduler({ task, enabled = true, intervalMinutes = 30, now, held = false }) {
+  const timers = [];
+  const cleared = [];
+  let release = () => {};
+  let gate = held ? new Promise((resolve) => { release = resolve; }) : Promise.resolve();
+  const triggers = [];
+  const scheduler = startScheduler({
+    intervalMs: intervalMinutes * 60_000,
+    enabled,
+    now,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimer: (id) => { cleared.push(id); },
+    task: async ({ trigger }) => {
+      triggers.push(trigger);
+      await gate;
+      await task?.({ trigger });
+    },
+  });
+  return {
+    scheduler,
+    timers,
+    cleared,
+    triggers,
+    holdNextRun() { gate = new Promise((resolve) => { release = resolve; }); },
+    releaseRun() { release(); gate = Promise.resolve(); },
+  };
+}
+
+test('admin sync: Sync now starts the service\'s own run, one at a time; in a dry run service nothing is written to HubSpot', async () => {
+  const h = await makeHarness();
+  addQuoteFamily(h.fake, { quote: 'Q1', customer: 'C1', contactNumber: '1' });
+  const summaries = [];
+  // The service starts with a scheduled run; it is held open here.
+  const s = testScheduler({ held: true, task: async () => { summaries.push(await executeRun(h.ctx({ dryRun: true }), { mode: 'incremental' })); } });
+  const a = await startAdmin(h, { runs: s.scheduler });
+  const { cookie, csrf } = await a.login();
+
+  let page = await a.request('GET', '/', { cookie });
+  assert.match(page.text, /<strong>A scheduled run is in progress<\/strong>, <span class="nowrap">started \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\.<\/span>/);
+  assert.match(page.text, /<form method="get" action="\/"><input type="hidden" name="watch" value="run"><button type="submit" class="secondary">Follow this run<\/button><\/form>/);
+  assert.doesNotMatch(page.text, /action="\/run"/);
+  assert.doesNotMatch(page.text, /http-equiv="refresh"/);
+
+  // While a run is going, another cannot be started.
+  const busy = await a.request('POST', '/run', { cookie, form: { csrf } });
+  assert.equal(busy.status, 409);
+  assert.match(busy.text, /Not started: a run is already in progress\./);
+  assert.deepEqual(s.triggers, ['schedule']);
+
+  s.releaseRun();
+  await untilIdle(s.scheduler);
+  assert.equal(summaries.length, 1);
+  assert.equal(s.timers.length, 1, 'the next scheduled run is planned');
+
+  page = await a.request('GET', '/', { cookie });
+  assert.match(page.text, /<form method="post" action="\/run"><input type="hidden" name="csrf" value="[^"]+"><button type="submit">Sync now<\/button><\/form>/);
+  assert.match(page.text, /Next scheduled run: <span class="nowrap">\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC<\/span>/);
+  assert.match(page.text, /Dry run: reads from HubSpot, changes nothing\./);
+
+  // The button is protected like every other form.
+  assert.equal((await a.request('POST', '/run', { form: { csrf } })).status, 401);
+  assert.equal((await a.request('POST', '/run', { cookie, form: {} })).status, 403);
+  assert.equal((await a.request('POST', '/run', { cookie, form: { csrf: 'guess' } })).status, 403);
+  assert.equal((await a.request('POST', '/run', { cookie, form: { csrf }, headers: { origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await a.request('POST', '/run', { cookie, form: { csrf }, headers: { 'sec-fetch-site': 'cross-site' } })).status, 403);
+  assert.equal((await a.request('GET', '/run', { cookie })).status, 404);
+  assert.deepEqual(s.triggers, ['schedule'], 'none of those started a run');
+
+  h.fake.clock += 20 * 60_000;
+  s.holdNextRun();
+  const started = await a.request('POST', '/run', { cookie, form: { csrf }, headers: browser(a) });
+  assert.equal(started.status, 303);
+  assert.equal(started.headers.get('location'), '/?watch=run');
+  assert.deepEqual(s.triggers, ['schedule', 'manual']);
+  assert.deepEqual(s.cleared, [1], 'the planned scheduled run is replaced by this one');
+  assert.equal(s.scheduler.status().runningTrigger, 'manual');
+
+  // The page it lands on reloads itself until the run is over.
+  const watching = await a.request('GET', '/?watch=run', { cookie });
+  assert.equal(watching.status, 200);
+  assert.match(watching.text, /<meta http-equiv="refresh" content="5; url=\/\?watch=run">/);
+  assert.match(watching.text, /<strong>A run started here is in progress<\/strong>/);
+  assert.match(watching.text, /This page reloads every 5 seconds until the run finishes\./);
+  assert.doesNotMatch(watching.text, /action="\/run"|Follow this run/);
+  // The ordinary page does not reload, so nothing typed into a form is lost.
+  assert.doesNotMatch((await a.request('GET', '/', { cookie })).text, /http-equiv="refresh"/);
+
+  const again = await a.request('POST', '/run', { cookie, form: { csrf } });
+  assert.equal(again.status, 409);
+  assert.deepEqual(s.triggers, ['schedule', 'manual']);
+
+  s.releaseRun();
+  await untilIdle(s.scheduler);
+  const finished = await a.request('GET', '/?watch=run', { cookie });
+  assert.equal(finished.status, 303);
+  assert.equal(finished.headers.get('location'), '/?notice=run_finished');
+  page = await a.request('GET', '/?notice=run_finished', { cookie });
+  assert.match(page.text, /The run has finished\. Its result is under Last run\./);
+  assert.match(page.text, /<span class="badge good">OK<\/span> <span class="badge info">Dry run<\/span>/);
+  assert.ok(page.text.includes(summaries[1].runId));
+  assert.doesNotMatch(page.text, /http-equiv="refresh"/);
+
+  // Both runs were dry runs of the service: HubSpot was read, never written.
+  assert.equal(summaries.length, 2);
+  for (const summary of summaries) {
+    assert.equal(summary.status, 'ok');
+    assert.equal(summary.dryRun, true);
+    assert.equal(summary.api.writes, 0);
+  }
+  assert.ok(h.fake.requests.length > 0);
+  assert.equal(h.fake.writes.length, 0);
+  assert.equal(await h.count('runs', 'dry_run'), 2);
+  assert.equal(await h.count('runs', 'NOT dry_run'), 0);
+  assert.equal(s.timers.length, 2, 'the schedule carries on after a run started by hand');
+  assert.ok(h.logs.some((l) => l.msg === 'run started from the admin page' && l.dryRun === true));
+
+  const everything = a.bodies.join('\n');
+  for (const [name, value] of Object.entries(SECRETS)) assert.ok(!everything.includes(value), name);
+  // The run control adds exactly two forms that post, and one that only reloads the page.
+  const actions = [...page.text.matchAll(/<form method="post" action="([^"]+)"/g)].map((m) => m[1]).sort();
+  assert.deepEqual(actions, ['/alerts', '/alerts/test', '/logout', '/password', '/run', '/schedule']);
+  for (const url of ['/reconcile', '/apply', '/cleanup-contacts', '/mapping', '/settings', '/dry-run', '/run/full', '/schedule/cron']) {
+    assert.equal((await a.request('POST', url, { cookie, form: { csrf, apply: '1', dry_run: 'false' } })).status, 404, url);
+  }
+  await s.scheduler.stop();
+  await a.close();
+  await h.cleanup();
+});
+
+test('admin sync: the page cannot change what a run does; in a live service Sync now is the same run the schedule makes', async () => {
+  const h = await makeHarness();
+  const family = addQuoteFamily(h.fake, { quote: 'Q1', customer: 'C1', contactNumber: '1' });
+  await saveScheduleSettings(h.db, { enabled: false, intervalMinutes: 30, now: new Date() });
+  const summaries = [];
+  const s = testScheduler({ enabled: false, task: async () => { summaries.push(await executeRun(h.ctx(), { mode: 'incremental' })); } });
+  const a = await startAdmin(h, { runs: s.scheduler, env: { DRY_RUN: 'false' } });
+  const { cookie, csrf } = await a.login();
+  assert.deepEqual(s.triggers, [], 'a paused schedule starts no run by itself');
+
+  const page = await a.request('GET', '/', { cookie });
+  assert.match(page.text, /Live: writes to HubSpot, like a scheduled run\./);
+  assert.match(page.text, /<strong>Scheduled runs are paused\.<\/strong>/);
+
+  // Extra fields that try to change the run are ignored: the run is the service's own.
+  const started = await a.request('POST', '/run', { cookie, form: { csrf, dry_run: 'true', apply: '0', mode: 'full', limit: '1', deal_amounts: '1' } });
+  assert.equal(started.status, 303);
+  await untilIdle(s.scheduler);
+  assert.equal(summaries.length, 1);
+  assert.equal(summaries[0].mode, 'incremental');
+  assert.equal(summaries[0].dryRun, false);
+  assert.equal(summaries[0].limit, null);
+  assert.deepEqual(h.fake.associated(T.line, family.lines[0], T.header), [family.header]);
+  assert.ok(h.fake.writes.length > 0);
+  assert.equal(s.timers.length, 0, 'paused: no scheduled run is planned after it');
+  await s.scheduler.stop();
+  await a.close();
+  await h.cleanup();
+});
+
+test('admin schedule: pause, resume and a fixed list of intervals; saved to the staging database, applied at once, and kept across a restart', async () => {
+  const h = await makeHarness();
+  let clock = Date.parse('2026-11-18T10:00:00Z');
+  const s = testScheduler({ now: () => clock });
+  await tick();
+  assert.deepEqual(s.triggers, ['schedule']);
+  assert.equal(s.timers[0].ms, 30 * 60_000);
+  const a = await startAdmin(h, { runs: s.scheduler, now: () => new Date(clock) });
+  const { cookie, csrf } = await a.login();
+  const options = (text) => [...text.matchAll(/<option value="([^"]+)"( selected)?>([^<]+)<\/option>/g)].map((m) => [m[1], Boolean(m[2]), m[3]]);
+
+  let page = await a.request('GET', '/', { cookie });
+  assert.match(page.text, /Scheduled runs are on: every 30 minutes\./);
+  assert.match(page.text, /Next scheduled run: <span class="nowrap">2026-11-18 10:30 UTC<\/span>/);
+  assert.match(page.text, /name="enabled" value="1" checked> Run on a schedule/);
+  assert.match(page.text, /This is still the starting schedule, from the RUN_INTERVAL_MINUTES service variable\./);
+  assert.deepEqual(options(page.text), [
+    ['15', false, 'Every 15 minutes'], ['30', true, 'Every 30 minutes'], ['60', false, 'Every hour'], ['120', false, 'Every 2 hours'],
+    ['240', false, 'Every 4 hours'], ['360', false, 'Every 6 hours'], ['720', false, 'Every 12 hours'], ['1440', false, 'Once a day'],
+  ]);
+  // A fixed list and nothing else: no box to type a schedule into.
+  assert.doesNotMatch(page.text, /cron/i);
+  assert.doesNotMatch(page.text, /<input[^>]*name="(interval_minutes|schedule|cron)"/);
+  assert.equal(await getScheduleSettings(h.db), null);
+
+  // Anything that is not on the list is refused, cron expressions included.
+  for (const value of ['45', '7', '', '0', '-30', '1e2', '30 30', '30,60', '*/5 * * * *', '0 9 * * 1-5', '@hourly', '30; DELETE FROM runs', '99999999']) {
+    const response = await a.request('POST', '/schedule', { cookie, form: { csrf, enabled: '1', interval_minutes: value } });
+    assert.equal(response.status, 400, value);
+    assert.match(response.text, /Schedule not saved\. Choose one of the listed intervals\./);
+  }
+  assert.equal((await a.request('POST', '/schedule', { cookie, form: { csrf, enabled: '1' } })).status, 400);
+  assert.equal((await a.request('POST', '/schedule', { form: { csrf, enabled: '1', interval_minutes: '60' } })).status, 401);
+  assert.equal((await a.request('POST', '/schedule', { cookie, form: { enabled: '1', interval_minutes: '60' } })).status, 403);
+  assert.equal((await a.request('POST', '/schedule', { cookie, form: { csrf, enabled: '1', interval_minutes: '60' }, headers: { origin: 'https://evil.example' } })).status, 403);
+  assert.equal(await getScheduleSettings(h.db), null);
+  assert.equal(s.scheduler.status().intervalMs, 30 * 60_000);
+  assert.equal(s.timers.length, 1);
+
+  // Every 2 hours.
+  clock += 10 * 60_000;
+  const saved = await a.request('POST', '/schedule', { cookie, form: { csrf, enabled: '1', interval_minutes: '120' }, headers: browser(a) });
+  assert.equal(saved.status, 303);
+  assert.equal(saved.headers.get('location'), '/?notice=schedule_saved');
+  let stored = await getScheduleSettings(h.db);
+  assert.equal(stored.enabled, true);
+  assert.equal(stored.intervalMinutes, 120);
+  assert.equal(s.scheduler.status().intervalMs, 120 * 60_000);
+  assert.equal(s.scheduler.status().nextRunAt, Date.parse('2026-11-18T12:00:00Z'), 'two hours after the last run started');
+  assert.equal(s.timers.at(-1).ms, 110 * 60_000);
+  page = await a.request('GET', '/?notice=schedule_saved', { cookie });
+  assert.match(page.text, /Schedule saved\./);
+  assert.match(page.text, /Scheduled runs are on: every 2 hours\./);
+  assert.match(page.text, /Next scheduled run: <span class="nowrap">2026-11-18 12:00 UTC<\/span>/);
+  assert.match(page.text, /Set on this page on 2026-11-18 10:10 UTC\. The RUN_INTERVAL_MINUTES service variable no longer applies\./);
+  assert.deepEqual(options(page.text).filter((o) => o[1]), [['120', true, 'Every 2 hours']]);
+
+  // Pause: unticking the box. The planned run is dropped; nothing starts by itself.
+  const paused = await a.request('POST', '/schedule', { cookie, form: { csrf, interval_minutes: '120' } });
+  assert.equal(paused.status, 303);
+  stored = await getScheduleSettings(h.db);
+  assert.equal(stored.enabled, false);
+  assert.equal(stored.intervalMinutes, 120);
+  assert.equal(s.scheduler.status().enabled, false);
+  assert.equal(s.scheduler.status().nextRunAt, null);
+  const timersWhenPaused = s.timers.length;
+  assert.ok(s.cleared.includes(timersWhenPaused), 'the pending timer was cancelled');
+  page = await a.request('GET', '/', { cookie });
+  assert.equal((page.text.match(/<strong>Scheduled runs are paused\.<\/strong>/g) || []).length, 2, 'said next to Sync now and in the Schedule box');
+  assert.match(page.text, /name="enabled" value="1"> Run on a schedule/);
+  assert.doesNotMatch(page.text, /Next scheduled run/);
+
+  // Sync now still works while paused, and does not bring the schedule back.
+  clock += 3 * 3_600_000;
+  assert.equal((await a.request('POST', '/run', { cookie, form: { csrf } })).status, 303);
+  await untilIdle(s.scheduler);
+  assert.deepEqual(s.triggers, ['schedule', 'manual']);
+  assert.equal(s.timers.length, timersWhenPaused);
+  assert.equal(s.scheduler.status().nextRunAt, null);
+
+  // Resume, every 15 minutes: counted from the run that was just started by hand.
+  clock += 5 * 60_000;
+  assert.equal((await a.request('POST', '/schedule', { cookie, form: { csrf, enabled: '1', interval_minutes: '15' } })).status, 303);
+  assert.equal(s.scheduler.status().enabled, true);
+  assert.equal(s.timers.at(-1).ms, 10 * 60_000);
+  assert.match((await a.request('GET', '/', { cookie })).text, /Next scheduled run: <span class="nowrap">2026-11-18 13:25 UTC<\/span>/);
+
+  const changes = h.logs.filter((l) => l.msg === 'schedule changed in the admin page').map((l) => [l.enabled, l.intervalMinutes]);
+  assert.deepEqual(changes, [[true, 120], [false, 120], [true, 15]]);
+  await s.scheduler.stop();
+  await a.close();
+
+  // After a restart the saved schedule is the one in force, whatever RUN_INTERVAL_MINUTES says.
+  const settings = loadSettings({ ...SECRETS, RUN_INTERVAL_MINUTES: '45' });
+  assert.deepEqual(await effectiveSchedule(h.db, settings), { enabled: true, intervalMinutes: 15, source: 'page', updatedAt: new Date(clock) });
+  // A variable value that is not on the list is offered as well, so the starting schedule can always be picked again.
+  const s2 = testScheduler({ now: () => clock, intervalMinutes: 15 });
+  await tick();
+  const b = await startAdmin(h, { runs: s2.scheduler, now: () => new Date(clock), env: { RUN_INTERVAL_MINUTES: '45' } });
+  const second = await b.login();
+  page = await b.request('GET', '/', { cookie: second.cookie });
+  assert.deepEqual(options(page.text).map((o) => o[0]), ['15', '30', '45', '60', '120', '240', '360', '720', '1440']);
+  assert.deepEqual(options(page.text).filter((o) => o[1]), [['15', true, 'Every 15 minutes']]);
+  assert.equal((await b.request('POST', '/schedule', { cookie: second.cookie, form: { csrf: second.csrf, enabled: '1', interval_minutes: '45' } })).status, 303);
+  assert.equal((await getScheduleSettings(h.db)).intervalMinutes, 45);
+  assert.equal(s2.scheduler.status().intervalMs, 45 * 60_000);
+  await s2.scheduler.stop();
+  await b.close();
+  await h.cleanup();
+});
+
+test('admin schedule: until it is saved on the page, RUN_INTERVAL_MINUTES is the schedule', async () => {
+  const h = await makeHarness();
+  assert.deepEqual(await effectiveSchedule(h.db, loadSettings({ ...SECRETS })), { enabled: true, intervalMinutes: 30, source: 'variable', updatedAt: null });
+  assert.deepEqual(await effectiveSchedule(h.db, loadSettings({ ...SECRETS, RUN_INTERVAL_MINUTES: '45' })), { enabled: true, intervalMinutes: 45, source: 'variable', updatedAt: null });
+  const s = testScheduler({ intervalMinutes: 45 });
+  await tick();
+  const a = await startAdmin(h, { runs: s.scheduler, env: { RUN_INTERVAL_MINUTES: '45' } });
+  const { cookie } = await a.login();
+  const page = await a.request('GET', '/', { cookie });
+  assert.match(page.text, /Scheduled runs are on: every 45 minutes\./);
+  assert.match(page.text, /<option value="45" selected>Every 45 minutes<\/option>/);
+  await s.scheduler.stop();
   await a.close();
   await h.cleanup();
 });

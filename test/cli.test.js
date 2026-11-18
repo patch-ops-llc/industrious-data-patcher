@@ -323,7 +323,7 @@ test('CLI: the service answers the health check and the admin page, runs straigh
     const result = await service.done;
     assert.equal(result.code, 0, result.stdout + result.stderr);
     const lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
-    assert.ok(lines.some((l) => l.msg === 'service starting' && l.intervalMinutes === 30 && l.dryRun === false && l.adminPage === 'on' && l.adminSignIn === 'ADMIN_PASSWORD variable' && l.port === port));
+    assert.ok(lines.some((l) => l.msg === 'service starting' && l.intervalMinutes === 30 && l.schedule === 'on' && l.scheduleFrom === 'RUN_INTERVAL_MINUTES variable' && l.dryRun === false && l.adminPage === 'on' && l.adminSignIn === 'ADMIN_PASSWORD variable' && l.port === port));
     assert.ok(lines.some((l) => l.msg === 'run finished' && l.status === 'ok'));
     assert.ok(lines.some((l) => /shutting down/.test(l.msg)));
     assert.ok(!result.stdout.includes(TOKEN), 'the token never appears in the log');
@@ -331,6 +331,96 @@ test('CLI: the service answers the health check and the admin page, runs straigh
     assert.deepEqual(fake.associated(P.line, ids.line, P.quote), [ids.quote]);
     assert.equal((await sql(`SELECT count(*)::int AS n FROM runs WHERE mode = 'incremental' AND NOT dry_run AND status = 'ok'`))[0].n, 1);
     assert.equal((await sql(`SELECT count(*)::int AS n FROM run_lock`))[0].n, 0);
+  });
+});
+
+test('CLI: Sync now on the admin page starts a run of the running service, and a paused schedule stays paused after a restart', async () => {
+  await withFakePortal(async ({ fake, env, sql }) => {
+    seedFamily(fake);
+    const port = await freePort();
+    const password = 'a long admin password';
+    const base = `http://127.0.0.1:${port}`;
+    const serviceEnv = { ...env, RUN_INTERVAL_MINUTES: '30', PORT: String(port), ADMIN_PASSWORD: password };
+    const form = (fields) => ({ method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields).toString() });
+    const healthy = () => waitFor(async () => {
+      try {
+        return (await fetch(`${base}/healthz`)).status === 200;
+      } catch {
+        return false;
+      }
+    }, 'the health check');
+    const runsFinished = (service) => (service.out.stdout.match(/"msg":"run finished"/g) || []).length;
+    async function signIn() {
+      const response = await fetch(`${base}/login`, form({ password }));
+      assert.equal(response.status, 303);
+      const cookie = response.headers.get('set-cookie').split(';')[0];
+      const page = await (await fetch(`${base}/`, { headers: { cookie } })).text();
+      return { cookie, page, csrf: page.match(/name="csrf" value="([^"]+)"/)[1] };
+    }
+    const post = (session, url, fields = {}) => {
+      const request = form({ csrf: session.csrf, ...fields });
+      request.headers.cookie = session.cookie;
+      return fetch(`${base}${url}`, request);
+    };
+
+    // No --apply and no DRY_RUN=false: the service is a dry run, and so is a run started from the page.
+    let service = startCli(['start'], serviceEnv);
+    try {
+      await healthy();
+      await waitFor(() => runsFinished(service) === 1, 'the run at start');
+      const session = await signIn();
+      assert.match(session.page, /<button type="submit">Sync now<\/button>/);
+      assert.match(session.page, /Scheduled runs are on: every 30 minutes\./);
+      const started = await post(session, '/run');
+      assert.equal(started.status, 303);
+      assert.equal(started.headers.get('location'), '/?watch=run');
+      await waitFor(() => runsFinished(service) === 2, 'the run started from the page');
+      const after = await (await fetch(`${base}/?watch=run`, { headers: { cookie: session.cookie }, redirect: 'manual' }));
+      assert.equal(after.status, 303);
+      assert.equal(after.headers.get('location'), '/?notice=run_finished');
+      // Pause, and choose every hour for when it is switched back on.
+      assert.equal((await post(session, '/schedule', { interval_minutes: '60' })).status, 303);
+    } finally {
+      service.child.kill('SIGTERM');
+    }
+    let result = await service.done;
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    let lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
+    assert.ok(lines.some((l) => l.msg === 'service starting' && l.schedule === 'on' && l.dryRun === true));
+    assert.ok(lines.some((l) => l.msg === 'run started from the admin page' && l.dryRun === true));
+    assert.ok(lines.some((l) => l.msg === 'schedule changed in the admin page' && l.enabled === false && l.intervalMinutes === 60));
+    assert.equal(fake.writes.length, 0, 'a dry run service writes nothing, also when the run is started by hand');
+    assert.equal((await sql(`SELECT count(*)::int AS n FROM runs WHERE mode = 'incremental' AND dry_run AND status = 'ok'`))[0].n, 2);
+    assert.equal((await sql(`SELECT count(*)::int AS n FROM runs WHERE NOT dry_run`))[0].n, 0);
+    assert.deepEqual((await sql(`SELECT enabled, interval_minutes FROM schedule_settings`)).map((r) => [r.enabled, Number(r.interval_minutes)]), [[false, 60]]);
+
+    // Restarted: still paused, so no run at start; Sync now still works.
+    service = startCli(['start'], serviceEnv);
+    try {
+      await healthy();
+      const session = await signIn();
+      assert.match(session.page, /<strong>Scheduled runs are paused\.<\/strong>/);
+      assert.match(session.page, /<option value="60" selected>Every hour<\/option>/);
+      assert.equal(runsFinished(service), 0);
+      assert.equal((await post(session, '/run')).status, 303);
+      await waitFor(() => runsFinished(service) === 1, 'the run started from the page');
+    } finally {
+      service.child.kill('SIGTERM');
+    }
+    result = await service.done;
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
+    assert.ok(lines.some((l) => l.msg === 'service starting' && l.schedule === 'paused' && l.scheduleFrom === 'the admin page' && l.intervalMinutes === 60));
+    assert.ok(lines.some((l) => /scheduled runs are paused/.test(l.msg)));
+    const startedByHand = lines.findIndex((l) => l.msg === 'run started from the admin page');
+    const firstRunLine = lines.findIndex((l) => l.runId);
+    assert.ok(startedByHand !== -1);
+    // The only run of this process is the one asked for on the page, after signing in.
+    assert.equal(lines.filter((l) => l.msg === 'run started').length, 1);
+    assert.ok(firstRunLine > lines.findIndex((l) => l.msg === 'admin signed in'), 'no run before Sync now was pressed');
+    assert.equal(fake.writes.length, 0);
+    assert.equal((await sql(`SELECT count(*)::int AS n FROM runs WHERE mode = 'incremental' AND dry_run`))[0].n, 3);
+    assert.ok(!(result.stdout + result.stderr).includes(TOKEN) && !(result.stdout + result.stderr).includes(password));
   });
 });
 

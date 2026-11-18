@@ -213,7 +213,7 @@ test('staging database: migrations create every table once, are safe to repeat, 
   const tables = (await db.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() ORDER BY 1`)).rows.map((r) => r.table_name);
   assert.deepEqual(tables, [
     'admin_password', 'alert_settings', 'alert_state', 'association_actions', 'contact_cleanup_removals', 'deal_amount_baselines', 'deal_amount_holds', 'ingest_cursors',
-    'review_items', 'run_lock', 'runs', 'schema_migrations', 'staging_associations', 'staging_records',
+    'review_items', 'run_lock', 'runs', 'schedule_settings', 'schema_migrations', 'staging_associations', 'staging_records',
   ]);
   // The columns behind "only when the quote gained a new line" (migration 003).
   const added = (await db.query(
@@ -242,6 +242,11 @@ test('staging database: migrations create every table once, are safe to repeat, 
   // The admin password table (migration 004) starts empty: the ADMIN_PASSWORD variable is the password until it is changed on the page.
   assert.ok(applied.includes('004_admin_password.sql'));
   assert.equal((await db.query('SELECT count(*)::int AS n FROM admin_password')).rows[0].n, 0);
+  // The schedule table (migration 005) starts empty too: RUN_INTERVAL_MINUTES applies until the schedule is saved on the admin page.
+  assert.ok(applied.includes('005_schedule_settings.sql'));
+  assert.equal((await db.query('SELECT count(*)::int AS n FROM schedule_settings')).rows[0].n, 0);
+  await assert.rejects(db.query(`INSERT INTO schedule_settings (id, enabled, interval_minutes, updated_at) VALUES (2, true, 30, now())`));
+  await assert.rejects(db.query(`INSERT INTO schedule_settings (id, enabled, interval_minutes, updated_at) VALUES (1, true, 0, now())`));
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'migrations-'));
   fs.writeFileSync(path.join(dir, '001_ok.sql'), 'CREATE TABLE extra_one (id int);');
@@ -492,4 +497,98 @@ test('scheduler: runs start a fixed interval apart, never overlap, survive a thr
   await new Promise((r) => setImmediate(r));
   assert.equal(timers.length, 2, 'nothing is scheduled after stop');
   assert.equal(maxActive, 1);
+});
+
+test('scheduler: a run can be started by hand, the schedule can be paused and its interval changed, and runs still never overlap', async () => {
+  const timers = [];
+  const cleared = [];
+  const triggers = [];
+  let clock = 1_000_000;
+  let release;
+  let active = 0;
+  let maxActive = 0;
+  const next = () => new Promise((r) => setImmediate(r));
+  const scheduler = startScheduler({
+    intervalMs: 60_000,
+    enabled: false,
+    now: () => clock,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimer: (id) => { cleared.push(id); },
+    task: async ({ trigger }) => {
+      triggers.push(trigger);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => { release = resolve; });
+      active -= 1;
+    },
+  });
+
+  // Paused from the start: nothing runs and nothing is planned.
+  await next();
+  assert.deepEqual(triggers, []);
+  assert.equal(timers.length, 0);
+  assert.deepEqual(scheduler.status(), { enabled: false, intervalMs: 60_000, running: false, runningSince: null, runningTrigger: null, nextRunAt: null, lastStartedAt: null });
+
+  // A run by hand works while paused, one at a time.
+  assert.deepEqual(scheduler.runNow(), { started: true });
+  assert.deepEqual(scheduler.runNow(), { started: false, reason: 'running' });
+  assert.deepEqual(triggers, ['manual']);
+  assert.deepEqual(scheduler.status(), { enabled: false, intervalMs: 60_000, running: true, runningSince: 1_000_000, runningTrigger: 'manual', nextRunAt: null, lastStartedAt: 1_000_000 });
+  clock += 5_000;
+  release();
+  await next();
+  assert.equal(scheduler.status().running, false);
+  assert.equal(timers.length, 0, 'still paused after a run by hand');
+
+  // Switched on: the next run is one interval after the last run started.
+  clock += 5_000;
+  scheduler.setSchedule({ enabled: true, intervalMs: 60_000 });
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 50_000);
+  assert.equal(scheduler.status().nextRunAt, 1_060_000);
+
+  // A longer interval moves the planned run; a shorter one that is already due runs at once.
+  scheduler.setSchedule({ enabled: true, intervalMs: 120_000 });
+  assert.deepEqual(cleared, [1]);
+  assert.equal(timers[1].ms, 110_000);
+  scheduler.setSchedule({ enabled: true, intervalMs: 5_000 });
+  assert.deepEqual(cleared, [1, 2]);
+  assert.equal(timers[2].ms, 0);
+
+  // A run by hand takes the place of the planned one and restarts the count.
+  scheduler.setSchedule({ enabled: true, intervalMs: 60_000 });
+  clock += 20_000;
+  assert.deepEqual(scheduler.runNow(), { started: true });
+  assert.deepEqual(cleared, [1, 2, 3, 4]);
+  // A change made during a run waits for the run to finish.
+  scheduler.setSchedule({ enabled: true, intervalMs: 90_000 });
+  assert.equal(timers.length, 4);
+  clock += 10_000;
+  release();
+  await next();
+  assert.equal(timers.length, 5);
+  assert.equal(timers[4].ms, 80_000);
+
+  // The timer starts a scheduled run; a run by hand is refused meanwhile.
+  clock += 80_000;
+  timers[4].fn();
+  assert.deepEqual(triggers, ['manual', 'manual', 'schedule']);
+  assert.equal(scheduler.status().runningTrigger, 'schedule');
+  assert.deepEqual(scheduler.runNow(), { started: false, reason: 'running' });
+  // Paused during a run: the run finishes, and no other is planned.
+  scheduler.setSchedule({ enabled: false, intervalMs: 90_000 });
+  release();
+  await next();
+  assert.equal(timers.length, 5);
+  assert.equal(scheduler.status().nextRunAt, null);
+
+  // After stop nothing starts any more.
+  scheduler.setSchedule({ enabled: true, intervalMs: 90_000 });
+  assert.equal(timers.length, 6);
+  await scheduler.stop();
+  assert.deepEqual(scheduler.runNow(), { started: false, reason: 'stopping' });
+  scheduler.setSchedule({ enabled: true, intervalMs: 1_000 });
+  assert.equal(timers.length, 6);
+  assert.equal(maxActive, 1);
+  assert.deepEqual(triggers, ['manual', 'manual', 'schedule']);
 });

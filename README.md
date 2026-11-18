@@ -62,6 +62,7 @@ Postgres, on Railway next to the service. It replaces the state file of the earl
 | `contact_cleanup_removals` | Item B2 cleanup: every association removed, for restore |
 | `alert_settings`, `alert_state` | Alert switch, recipients, repeat interval; whether runs are currently failing |
 | `admin_password` | The admin page password once it has been changed on the page, as salted hashes only. Empty while `ADMIN_PASSWORD` is the password |
+| `schedule_settings` | The schedule once it has been saved on the admin page: on or paused, and how often. Empty while `RUN_INTERVAL_MINUTES` is the schedule |
 | `run_lock` | Stops two live runs from writing at the same time |
 
 HubSpot stays the authority. Before creating anything the service re-reads the associations of the records involved from HubSpot, and every `FULL_REFRESH_HOURS` it re-reads everything. If the database is lost, the next run rebuilds the staging copy from HubSpot; see the runbook for what else is affected.
@@ -115,7 +116,7 @@ The repository is `patch-ops-llc/industrious-data-patcher` on GitHub and the Rai
 | `DRY_RUN` | Leave unset (dry run) until go-live, then `false` |
 | `RESEND_API_KEY`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | For email alerts. `ALERT_EMAIL_TO` is only the starting list; recipients are edited on the admin page afterwards |
 | `ALERT_SLACK_WEBHOOK_URL` | Optional, for Slack alerts |
-| `RUN_INTERVAL_MINUTES` | Optional; 30 by default |
+| `RUN_INTERVAL_MINUTES` | Optional; 30 by default. The starting schedule only: once the schedule is saved on the admin page, the page's value applies |
 
 5. Generate a public domain for the service (Settings, Networking). The admin page is served there over HTTPS. Railway sets `PORT` itself.
 6. Deploy. The pre-deploy step creates the tables; the service then starts in dry run, makes its first run straight away, and repeats every 30 minutes.
@@ -127,7 +128,7 @@ Run exactly one replica. A second copy would be held off by the run lock, but th
 1. `preflight`, then `reconcile` as a dry run. Review the report (see "Reports").
 2. `reconcile --limit <n> --apply` for a small live sample, and check those records in HubSpot.
 3. `reconcile --apply` for the full reconciliation. Its report holds the association counts before and after. Linking lines that were sitting unassociated changes the amount of their quotes, and the deals of those quotes are then updated: in the same run where HubSpot has already recalculated the quote amount, otherwise in the next live run (see "Item B3 and the quote amount"). The dry run of step 1 lists these deal changes in advance. Closed deals are left alone, and changes that would set a deal to 0, move it by more than 1,000,000 or change it by more than 50% are held, not applied. The `-deal-amounts.csv` of each run lists every deal changed, every change held and every closed deal left alone, with the amount before and after.
-4. Set `DRY_RUN=false` on the service so the scheduled runs write.
+4. Set `DRY_RUN=false` on the service so its runs write (the scheduled ones and "Sync now" on the admin page).
 5. After validation, turn off the HubSpot association workflows. That is a manual step in HubSpot; this service does not change workflows, and it does not conflict with them while they are on.
 
 Commands are run in a shell on the service (Railway CLI: `railway ssh`, then `node src/cli.js <command>`), so they use the service's variables and database.
@@ -136,7 +137,7 @@ Commands are run in a shell on the service (Railway CLI: `railway ssh`, then `no
 
 | Command | Reads from HubSpot | Changes in HubSpot (only with `--apply` or `DRY_RUN=false`) | Writes elsewhere |
 | --- | --- | --- | --- |
-| `start` | As `run`, every `RUN_INTERVAL_MINUTES` | As `run` | Staging database. Serves the admin page and `/healthz` |
+| `start` | As `run`, on the schedule (`RUN_INTERVAL_MINUTES`, or the schedule saved on the admin page) and when "Sync now" is pressed there | As `run` | Staging database. Serves the admin page and `/healthz` |
 | `run` | Records created or modified since the last run (everything on the first run and every `FULL_REFRESH_HOURS`) | Creates missing associations. Sets `amount` on open deals whose quote gained a new line and changed amount, except changes held by the guard | Staging database, report files |
 | `reconcile` | Every record of every object, and every association | Creates missing associations. Deal amounts as `run` | Staging database, `reconciliation-*` report files |
 | `reconcile --deal-amounts` | Same | Also sets every deal amount that differs from its quote amount, for that one run, whether or not the quote gained a line (the catch-up; off unless asked for, see Item B3). Closed deals are still left alone and the guard applies here too | Same |
@@ -179,17 +180,27 @@ Editing mappings in a web page is a later phase in the spec and is not built.
 
 ## The admin page
 
-`start` serves a small page on the service's public address for alert control only:
+`start` serves a small page on the service's public address:
 
-- turn alerts on and off,
-- set the email recipients and the repeat interval,
-- send a test alert,
 - see the status and counts of the last run,
+- start a run now ("Sync now"),
+- pause the schedule or change how often it runs,
+- turn alerts on and off, set the email recipients and the repeat interval,
+- send a test alert,
 - change the page's own password.
 
 These settings are stored in the staging database, so they survive restarts and deploys.
 
-What it does not do, by design: it has no control that writes to HubSpot, cannot start a run, cannot switch dry run on or off, cannot edit mappings, and never shows the HubSpot token, the Resend key, the Slack webhook, the database address or the password. Those are service variables, and the only secret a form on the page accepts is the page's own password. The admin code does not load the HubSpot client at all.
+**Sync now.** The button starts the run the schedule would make next: the incremental `run`, in the mode the service is in. While `DRY_RUN` is not `false` that is a dry run, which reads from HubSpot and changes nothing; after go-live it writes, exactly as a scheduled run does. The page cannot choose the mode, a limit or a full reconciliation, and anything extra sent with the form is ignored. One run at a time: while a run is in progress the button is replaced by "Follow this run", and a request to start another is refused. After pressing it the page reloads every 5 seconds until the run has finished and then shows the result under Last run. The run counts as a run of the service: alerts follow its result, and the next scheduled run comes one interval after it started.
+
+**The schedule.** One tick box and one list:
+
+- "Run on a schedule" switches the scheduled runs on or off. Paused, the service runs only when "Sync now" is pressed, and it does not run at start either; the run in progress when it is paused finishes.
+- "How often" is a fixed list: every 15 or 30 minutes, every hour, every 2, 4, 6 or 12 hours, once a day, plus the value of `RUN_INTERVAL_MINUTES` if that is not one of them. Nothing else is accepted: no free-form interval, no times of day, no cron expression.
+- The interval is counted from the start of one run to the start of the next, and runs never overlap. A change takes effect at once, without a restart: the next run comes one interval after the last one started, or straight away if that moment has passed.
+- Until the schedule is saved on the page, `RUN_INTERVAL_MINUTES` is the schedule and it is on. Once it has been saved, the page's value applies and the variable is ignored (table `schedule_settings`). The service log says at start which of the two is in use (`schedule`, `scheduleFrom`).
+
+What the page does not do, by design: it cannot switch dry run on or off, cannot run a full reconciliation or the contact cleanup, cannot edit mappings, and never shows the HubSpot token, the Resend key, the Slack webhook, the database address or the password. Those are service variables and commands, and the only secret a form on the page accepts is the page's own password. The admin code does not load the HubSpot client or the run engine at all: "Sync now" and the schedule only pass a request to the service's scheduler, which runs what it would have run anyway.
 
 Sign-in is one shared password, not individual accounts. Ten wrong passwords within 15 minutes, at sign-in or as the current password on the change form, lock both for everyone until they age out. Sessions last `ADMIN_SESSION_HOURS` (12) and end when the service restarts.
 
@@ -265,6 +276,6 @@ A dry run lists the changes it would hold without recording them.
 
 ## Tested and not tested
 
-Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, the admin page's sign-in and form protections, and changing and recovering the admin password. A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page, including the password change, was checked in Chrome at desktop and phone widths against a local run with the stand-in HubSpot. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
+Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, the admin page's sign-in and form protections, changing and recovering the admin password, and "Sync now" and the schedule (through the real service in dry run, and the scheduler with pausing, interval changes and runs by hand). A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page, including the password change, "Sync now" and the schedule, was checked in Chrome at desktop and phone widths against a local dry run with the stand-in HubSpot. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
 
 Not tested: any write to the real portal; a live `reconcile` against the real portal; the amounts HubSpot's rollup really shows after lines are linked (the projection assumes the quote amount is the sum of its line amounts, which held for every quote with lines when the portal was read); a live run on Railway (the build and the migrations have run there, the migrations against Railway's Postgres 18); delivery through the real Resend API or a real Slack webhook; `docker-compose.yml`.

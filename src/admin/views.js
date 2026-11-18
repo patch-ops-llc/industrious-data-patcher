@@ -30,14 +30,15 @@ function count(value) {
 
 const LOGO = '<img class="logo" src="/assets/logo.svg" alt="Industrious Group" width="193" height="40">';
 
-function page(title, body, { bodyClass = '' } = {}) {
+function page(title, body, { bodyClass = '', refresh = null } = {}) {
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<meta name="theme-color" content="#29292b">
+<meta name="theme-color" content="#29292b">${refresh ? `
+<meta http-equiv="refresh" content="${esc(refresh.seconds)}; url=${esc(refresh.url)}">` : ''}
 <title>${esc(title)} | Industrious Group</title>
 <link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
@@ -63,7 +64,7 @@ ${inner}
 export function loginPage({ error = '' } = {}) {
   return panelPage('Sign in', `<p class="eyebrow">Association cleanup</p>
 <h1>Sign in</h1>
-<p class="muted">Alert settings and run status for the Epicor and HubSpot association cleanup.</p>
+<p class="muted">Run status, schedule and alerts for the Epicor and HubSpot association cleanup.</p>
 ${error ? `<p class="notice bad" role="alert">${esc(error)}</p>` : ''}
 <form method="post" action="/login">
 <label for="password">Password</label>
@@ -96,11 +97,44 @@ function stat(label, value, note, tone = '') {
 
 const plural = (n, one, many) => `${count(n)} ${n === 1 ? one : many}`;
 
-function lastRunCard(run) {
+const RELOAD_SECONDS = 5;
+
+/** Sync now, and when the next scheduled run is. Empty when the page has no run control. */
+function syncBlock(sync, hidden) {
+  if (!sync) return '';
+  const effect = sync.dryRun
+    ? 'Dry run: reads from HubSpot, changes nothing.'
+    : 'Live: writes to HubSpot, like a scheduled run.';
+  if (sync.running) {
+    const what = sync.runningTrigger === 'manual' ? 'A run started here' : 'A scheduled run';
+    return `<div class="sync">
+${sync.watching ? '' : '<form method="get" action="/"><input type="hidden" name="watch" value="run"><button type="submit" class="secondary">Follow this run</button></form>'}
+<p class="sync-state"><strong>${what} is in progress</strong>, <span class="nowrap">started ${esc(when(sync.runningSince))}.</span></p>
+<p class="hint">${sync.watching ? `This page reloads every ${RELOAD_SECONDS} seconds until the run finishes.` : 'Sync now is available again when it finishes.'}</p>
+</div>`;
+  }
+  let next;
+  if (!sync.enabled) next = '<strong>Scheduled runs are paused.</strong>';
+  else if (sync.nextRunAt) next = `Next scheduled run: <span class="nowrap">${esc(when(sync.nextRunAt))}</span>`;
+  else next = 'Scheduled runs are on.';
+  return `<div class="sync">
+<form method="post" action="/run">${hidden}<button type="submit">Sync now</button></form>
+<p class="sync-state">${next}</p>
+<p class="hint">${effect}</p>
+</div>`;
+}
+
+function lastRunCard(run, sync, hidden) {
+  const controls = syncBlock(sync, hidden);
   if (!run) {
     return `<section class="card">
+<div class="run-head">
+<div>
 <h2>Last run</h2>
 <p class="muted">No run has been recorded yet.</p>
+</div>
+${controls}
+</div>
 </section>`;
   }
   const [tone, label] = STATUS[run.status] || ['info', run.status];
@@ -140,11 +174,16 @@ ${stat('Failed', failed, failed ? 'see the service log' : 'nothing failed', fail
 </div>`
     : '';
 
-  const kind = run.mode === 'full' ? 'Reconciliation' : 'Scheduled run';
+  const kind = run.mode === 'full' ? 'Reconciliation' : 'Sync';
   const timing = run.finishedAt ? `finished ${when(run.finishedAt)}` : `started ${when(run.startedAt)}, not finished`;
   return `<section class="card">
+<div class="run-head">
+<div>
 <h2>Last run</h2>
 <p class="run-state"><span class="badge ${tone}">${esc(label)}</span> <span class="badge ${dry ? 'info' : 'live'}">${dry ? 'Dry run' : 'Live'}</span> <span class="run-when">${kind}, ${esc(timing)}</span></p>
+</div>
+${controls}
+</div>
 ${stats}
 <dl class="wide">
 <dt>Type</dt><dd>${kind}</dd>
@@ -206,7 +245,35 @@ ${hidden}
 </section>`;
 }
 
-export function dashboardPage({ csrf, run, alertSettings, alertState, channels, fromAddress, service, password, form = null, notice = null, error = null, maxRecipients }) {
+function scheduleCard(sync, hidden) {
+  if (!sync) return '';
+  const state = sync.enabled
+    ? `Scheduled runs are on: ${esc(sync.intervalLabel.toLowerCase())}.`
+    : '<strong>Scheduled runs are paused.</strong> Runs only start with Sync now.';
+  const source = sync.source === 'page'
+    ? `Set on this page on ${esc(when(sync.updatedAt))}. The RUN_INTERVAL_MINUTES service variable no longer applies.`
+    : 'This is still the starting schedule, from the RUN_INTERVAL_MINUTES service variable.';
+  const options = sync.choices
+    .map((choice) => `<option value="${esc(choice.minutes)}"${choice.minutes === sync.intervalMinutes ? ' selected' : ''}>${esc(choice.label)}</option>`)
+    .join('\n');
+  return `<section class="card">
+<h2>Schedule</h2>
+<p class="muted">${state}</p>
+<form method="post" action="/schedule">
+${hidden}
+<label class="check"><input type="checkbox" name="enabled" value="1"${sync.enabled ? ' checked' : ''}> Run on a schedule</label>
+<label for="interval_minutes">How often</label>
+<select id="interval_minutes" name="interval_minutes">
+${options}
+</select>
+<p class="hint">Counted from the start of one run to the start of the next. A change takes effect straight away.</p>
+<button type="submit">Save schedule</button>
+</form>
+<p class="hint">${source}</p>
+</section>`;
+}
+
+export function dashboardPage({ csrf, run, alertSettings, alertState, channels, fromAddress, service, password, sync = null, form = null, notice = null, error = null, maxRecipients }) {
   const values = form || {
     enabled: alertSettings.enabled,
     recipients: alertSettings.emailRecipients.join('\n'),
@@ -214,8 +281,9 @@ export function dashboardPage({ csrf, run, alertSettings, alertState, channels, 
   };
   const hidden = `<input type="hidden" name="csrf" value="${esc(csrf)}">`;
   const mode = service.dryRun
-    ? ['dry', 'Dry run', 'Scheduled runs change nothing in HubSpot']
-    : ['live', 'Live', 'Scheduled runs write to HubSpot'];
+    ? ['dry', 'Dry run', 'Runs change nothing in HubSpot']
+    : ['live', 'Live', 'Runs write to HubSpot'];
+  const refresh = sync?.running && sync.watching ? { seconds: RELOAD_SECONDS, url: '/?watch=run' } : null;
   return page('Association cleanup', `<header class="top">
 <div class="wrap top-inner">
 ${LOGO}
@@ -227,7 +295,7 @@ ${LOGO}
 <div>
 <p class="eyebrow">Epicor and HubSpot</p>
 <h1>Association cleanup</h1>
-<p class="hero-sub">Alert settings and run status</p>
+<p class="hero-sub">${sync ? 'Run status, schedule and alerts' : 'Alert settings and run status'}</p>
 </div>
 <p class="mode ${mode[0]}"><strong>${mode[1]}</strong><span>${mode[2]}</span></p>
 </div>
@@ -235,9 +303,10 @@ ${LOGO}
 <main class="wrap">
 ${notice ? `<p class="notice good" role="status">${esc(notice)}</p>` : ''}
 ${error ? `<p class="notice bad" role="alert">${esc(error)}</p>` : ''}
-${lastRunCard(run)}
+${lastRunCard(run, sync, hidden)}
 <div class="columns">
 <div class="column">
+${scheduleCard(sync, hidden)}
 <section class="card">
 <h2>Alerts</h2>
 <p class="muted">An alert goes out when a run fails or finishes with errors, again at most once per repeat interval while runs keep failing, and once more when a run succeeds again.${alertState.failing ? ' <strong>Runs are currently failing.</strong>' : ''}</p>
@@ -254,27 +323,29 @@ ${hidden}
 <button type="submit">Save alert settings</button>
 </form>
 </section>
+</div>
+<div class="column">
 <section class="card">
 <h2>Test alert</h2>
 <p class="muted">Sends a test message to the saved recipients and to Slack, whether or not alerts are switched on.</p>
 ${lastSent(alertState)}
 <form method="post" action="/alerts/test">${hidden}<button type="submit" class="secondary">Send test alert</button></form>
 </section>
-</div>
-<div class="column">
 ${passwordCard(password, hidden)}
 <section class="card">
 <h2>Service</h2>
 <dl>
-<dt>Mode</dt><dd>${service.dryRun ? 'Dry run: scheduled runs change nothing in HubSpot' : 'Live: scheduled runs write to HubSpot'}</dd>
-<dt>Schedule</dt><dd>Every ${esc(service.intervalMinutes)} minutes</dd>
+<dt>Mode</dt><dd>${service.dryRun ? 'Dry run: runs change nothing in HubSpot' : 'Live: runs write to HubSpot'}</dd>${sync ? '' : `
+<dt>Schedule</dt><dd>Every ${esc(service.intervalMinutes)} minutes</dd>`}
 </dl>
-<p class="hint">The mode, the schedule, the field mappings and all keys are service settings and cannot be changed here.</p>
+<p class="hint">${sync
+    ? 'The mode, the field mappings and all keys are service settings and cannot be changed here.'
+    : 'The mode, the schedule, the field mappings and all keys are service settings and cannot be changed here.'}</p>
 </section>
 </div>
 </div>
 </main>
 <footer class="foot">
 <div class="wrap">Industrious Group &middot; HubSpot association cleanup</div>
-</footer>`);
+</footer>`, { refresh });
 }

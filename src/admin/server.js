@@ -4,20 +4,26 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { sendTestAlert } from '../alerts.js';
 import { MAX_EMAIL_RECIPIENTS, parseEmailList } from '../config.js';
-import { clearAdminPassword, getAdminPassword, getAlertSettings, getAlertState, lastRun, saveAdminPassword, saveAlertSettings } from '../db/store.js';
+import { clearAdminPassword, getAdminPassword, getAlertSettings, getAlertState, lastRun, saveAdminPassword, saveAlertSettings, saveScheduleSettings } from '../db/store.js';
+import { effectiveSchedule, intervalChoices, intervalLabel } from '../schedule.js';
 import { hashPassword, verifyPassword } from './password.js';
 import { dashboardPage, loginPage, messagePage } from './views.js';
 
 /**
- * The admin page: alert control only.
+ * The admin page: alerts, the run schedule, and starting a run by hand.
  *
  * It can switch alerts on and off, set the email recipients and the repeat
- * interval, send a test alert, show the last run's status, and change its
- * own password. It has no access to HubSpot: this module does not import the
- * HubSpot client or the run engine, so nothing on the page can write to
- * HubSpot. Secrets (HubSpot token, Resend key, Slack webhook, database URL,
- * admin password) are never rendered, and the only secret a form field
- * accepts is the admin password itself.
+ * interval, send a test alert, show the last run's status, change its own
+ * password, pause the schedule or pick its interval from a fixed list, and
+ * start a run now ("Sync now").
+ *
+ * This module does not import the HubSpot client or the run engine. The one
+ * way it reaches HubSpot is by asking the service's scheduler, handed in as
+ * "runs", to start the service's own run: the same run the schedule starts,
+ * in the mode the service is in (dry run or live). The page cannot change
+ * that mode, the mappings, or what a run does. Secrets (HubSpot token, Resend
+ * key, Slack webhook, database URL, admin password) are never rendered, and
+ * the only secret a form field accepts is the admin password itself.
  *
  * The password is the ADMIN_PASSWORD service variable until it is changed on
  * the page. From then on the staging database holds a salted hash of the new
@@ -42,6 +48,7 @@ const ASSETS = {
   '/assets/admin.css': { body: file('./admin.css'), type: 'text/css; charset=utf-8', maxAge: 300 },
   '/assets/logo.svg': { body: file('./assets/logo.svg'), type: 'image/svg+xml', maxAge: DAY_SECONDS },
   '/assets/gear.svg': { body: file('./assets/gear.svg'), type: 'image/svg+xml', maxAge: DAY_SECONDS },
+  '/assets/chevron.svg': { body: file('./assets/chevron.svg'), type: 'image/svg+xml', maxAge: DAY_SECONDS },
   '/assets/favicon.png': { body: file('./assets/favicon.png'), type: 'image/png', maxAge: DAY_SECONDS },
   '/assets/apple-touch-icon.png': { body: file('./assets/apple-touch-icon.png'), type: 'image/png', maxAge: DAY_SECONDS },
   '/assets/montserrat-latin.woff2': { body: file('./assets/montserrat-latin.woff2'), type: 'font/woff2', maxAge: DAY_SECONDS },
@@ -51,6 +58,8 @@ const NOTICES = {
   saved: 'Alert settings saved.',
   signed_out: 'You are signed out.',
   password_changed: 'Password changed. Every other session was signed out.',
+  schedule_saved: 'Schedule saved.',
+  run_finished: 'The run has finished. Its result is under Last run.',
 };
 
 function sameSecret(a, b) {
@@ -104,7 +113,11 @@ function redactor(settings) {
   };
 }
 
-export function createAdminServer({ db, settings, alerter, logger, now = () => new Date() }) {
+/**
+ * runs is the service's scheduler ({ runNow, setSchedule, status }). Without
+ * it the page has no Sync now button and no schedule controls.
+ */
+export function createAdminServer({ db, settings, alerter, logger, runs = null, now = () => new Date() }) {
   const password = settings.adminPassword || '';
   const enabled = password.length >= MIN_PASSWORD_LENGTH;
   const sessionMs = settings.adminSessionHours * 3_600_000;
@@ -209,13 +222,35 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
     }
   }
 
-  async function renderDashboard(res, session, { status = 200, notice = null, error = null, form = null } = {}) {
+  /** What the page shows about the schedule and a run in progress; null when the page has no run control. */
+  async function syncView(watching) {
+    if (!runs) return null;
+    const state = runs.status() || {};
+    const schedule = await effectiveSchedule(db, settings);
+    return {
+      dryRun: settings.dryRun,
+      running: Boolean(state.running),
+      runningSince: state.runningSince ?? null,
+      runningTrigger: state.runningTrigger ?? null,
+      nextRunAt: state.nextRunAt ?? null,
+      watching,
+      enabled: schedule.enabled,
+      intervalMinutes: schedule.intervalMinutes,
+      intervalLabel: intervalLabel(schedule.intervalMinutes),
+      source: schedule.source,
+      updatedAt: schedule.updatedAt,
+      choices: intervalChoices(settings).map((minutes) => ({ minutes, label: intervalLabel(minutes) })),
+    };
+  }
+
+  async function renderDashboard(res, session, { status = 200, notice = null, error = null, form = null, watching = false } = {}) {
     const [alertSettings, alertState, run, stored] = [
       await getAlertSettings(db),
       await getAlertState(db),
       await lastRun(db, { modes: ['incremental', 'full'] }),
       await storedPassword(),
     ];
+    const sync = await syncView(watching);
     if (run?.error) run.error = redact(run.error);
     if (alertState.lastResult) {
       alertState.lastResult = Object.fromEntries(Object.entries(alertState.lastResult).map(([k, v]) => [k, redact(v)]));
@@ -229,6 +264,7 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
       fromAddress: settings.alerts.emailFrom,
       service: { dryRun: settings.dryRun, intervalMinutes: settings.runIntervalMinutes },
       password: { changedAt: stored ? stored.changedAt : null, minLength: MIN_PASSWORD_LENGTH, maxLength: MAX_PASSWORD_LENGTH },
+      sync,
       form,
       notice,
       error,
@@ -305,6 +341,31 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
     return redirect(res, '/?notice=saved');
   }
 
+  /** Sync now: asks the scheduler to start the service's run. One run at a time. */
+  async function handleRunNow(req, res, session) {
+    const result = runs.runNow();
+    if (!result.started) {
+      const why = result.reason === 'running' ? 'a run is already in progress.' : 'the service is restarting. Try again in a moment.';
+      return renderDashboard(res, session, { status: 409, error: `Not started: ${why}` });
+    }
+    logger?.info('run started from the admin page', { dryRun: settings.dryRun });
+    return redirect(res, '/?watch=run');
+  }
+
+  async function handleSaveSchedule(req, res, session, form) {
+    const enabledValue = form.get('enabled') === '1';
+    const text = (form.get('interval_minutes') || '').trim();
+    const minutes = /^\d{1,5}(\.\d{1,3})?$/.test(text) ? Number(text) : NaN;
+    // Only the listed intervals are accepted; there is no free-form schedule.
+    if (!intervalChoices(settings).includes(minutes)) {
+      return renderDashboard(res, session, { status: 400, error: 'Schedule not saved. Choose one of the listed intervals.' });
+    }
+    await saveScheduleSettings(db, { enabled: enabledValue, intervalMinutes: minutes, now: now() });
+    runs.setSchedule({ enabled: enabledValue, intervalMs: minutes * 60_000 });
+    logger?.info('schedule changed in the admin page', { enabled: enabledValue, intervalMinutes: minutes });
+    return redirect(res, '/?notice=schedule_saved');
+  }
+
   async function handleTestAlert(req, res, session) {
     const at = now().getTime();
     if (at - lastTestAt < TEST_COOLDOWN_MS) {
@@ -360,7 +421,10 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
 
     if (method === 'GET') {
       if (path !== '/') return send(res, 404, messagePage('Not found', 'There is no page at this address.'));
-      return renderDashboard(res, session, { notice: NOTICES[url.searchParams.get('notice')] || null });
+      // After Sync now the page reloads itself until the run is over, then says so.
+      const watching = Boolean(runs) && url.searchParams.get('watch') === 'run';
+      if (watching && !runs.status()?.running) return redirect(res, '/?notice=run_finished');
+      return renderDashboard(res, session, { notice: NOTICES[url.searchParams.get('notice')] || null, watching });
     }
 
     const form = await readForm(req);
@@ -374,6 +438,8 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
     if (path === '/alerts') return handleSaveAlerts(req, res, session, form);
     if (path === '/alerts/test') return handleTestAlert(req, res, session);
     if (path === '/password') return handleChangePassword(req, res, session, form);
+    if (runs && path === '/run') return handleRunNow(req, res, session);
+    if (runs && path === '/schedule') return handleSaveSchedule(req, res, session, form);
     return send(res, 404, messagePage('Not found', 'There is no page at this address.'));
   }
 

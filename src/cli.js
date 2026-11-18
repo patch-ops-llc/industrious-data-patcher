@@ -14,6 +14,7 @@ import { HubSpotClient } from './hubspot/client.js';
 import { createLogger } from './logger.js';
 import { runDiscover, runPreflight } from './preflight.js';
 import { summaryLines, writeRunReport } from './report.js';
+import { effectiveSchedule } from './schedule.js';
 import { startScheduler } from './scheduler.js';
 import { runStamp } from './util.js';
 
@@ -22,7 +23,8 @@ const USAGE = `Industrious association cleanup middleware (Option B v3)
 Usage: node src/cli.js <command> [options]
 
 Commands
-  start              The service: admin page on PORT plus one run every RUN_INTERVAL_MINUTES.
+  start              The service: admin page on PORT plus one run every RUN_INTERVAL_MINUTES
+                     (or as set on the admin page).
   run                One scheduled-style run.
   reconcile          Full run: re-reads everything from HubSpot and writes a before/after
                      reconciliation report.
@@ -166,15 +168,26 @@ async function commandStart(cli) {
   const { settings, logger, db } = ctx;
   const alerter = createAlerter(settings.alerts, { logger });
   const notifier = createRunNotifier({ db, alerter, defaults: settings.alerts, logger });
-  const admin = createAdminServer({ db, settings, alerter, logger });
+  // The admin page starts runs and changes the schedule through the scheduler, which is started further down.
+  let scheduler = null;
+  const runs = {
+    status: () => scheduler?.status() ?? null,
+    runNow: () => (scheduler ? scheduler.runNow() : { started: false, reason: 'starting' }),
+    setSchedule: (schedule) => scheduler?.setSchedule(schedule),
+  };
+  const admin = createAdminServer({ db, settings, alerter, logger, runs });
   const address = await admin.listen(settings.port);
   const alertSettings = await getAlertSettings(db);
   const channels = alerter.status(alertSettings.emailRecipients);
   // Also applies the recovery rule: a new ADMIN_PASSWORD value replaces a password set on the page.
   const signInWith = await admin.passwordSource();
+  // RUN_INTERVAL_MINUTES, until the schedule is changed on the admin page.
+  const schedule = await effectiveSchedule(db, settings);
 
   logger.info('service starting', {
-    intervalMinutes: settings.runIntervalMinutes,
+    intervalMinutes: schedule.intervalMinutes,
+    schedule: schedule.enabled ? 'on' : 'paused',
+    scheduleFrom: schedule.source === 'page' ? 'the admin page' : 'RUN_INTERVAL_MINUTES variable',
     dryRun: settings.dryRun,
     port: address.port,
     adminPage: admin.enabled ? 'on' : 'off',
@@ -186,9 +199,11 @@ async function commandStart(cli) {
   if (settings.dryRun) logger.warn(modeBanner(true));
   if (!admin.enabled) logger.warn(`ADMIN_PASSWORD is not set (or shorter than ${MIN_PASSWORD_LENGTH} characters); the admin page is switched off`);
   if (!channels.email && !channels.slack) logger.warn('no alert channel is set up; failures will only appear in the log and on the admin page');
+  if (!schedule.enabled) logger.warn('scheduled runs are paused on the admin page; runs only start with Sync now');
 
-  const scheduler = startScheduler({
-    intervalMs: settings.runIntervalMinutes * 60_000,
+  scheduler = startScheduler({
+    intervalMs: schedule.intervalMinutes * 60_000,
+    enabled: schedule.enabled,
     logger,
     task: async () => {
       const summary = await executeRun(ctx, { mode: 'incremental' });

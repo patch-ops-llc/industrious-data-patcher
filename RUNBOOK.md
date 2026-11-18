@@ -6,8 +6,11 @@ The service works only in HubSpot. It does not connect to Epicor or Jitterbit. I
 
 ## Schedule
 
-- The service makes one run every `RUN_INTERVAL_MINUTES` (default 30). Change the variable in Railway and redeploy to change it.
-- Runs never overlap. If a run takes longer than the interval, the next one starts when it finishes.
+- The service makes one run every `RUN_INTERVAL_MINUTES` (default 30) until the schedule is saved on the admin page. From then on the page's schedule applies and the variable is ignored.
+- **Changing it:** sign in to the admin page and use the Schedule box. Choose how often from the list (every 15 or 30 minutes, every hour, every 2, 4, 6 or 12 hours, once a day) and press "Save schedule". It takes effect straight away, with no redeploy, and is kept across restarts and deploys. The interval is counted from the start of one run to the start of the next. There are no times of day and no cron expressions.
+- **Pausing it:** untick "Run on a schedule" and save. The run in progress, if any, finishes; no other run starts by itself, also not after a restart or deploy, until the box is ticked again. The page and the log line `service starting` (`schedule: paused`) say so. A paused service notices nothing in HubSpot, so do not leave it paused by accident.
+- **Running one now:** "Sync now" on the admin page starts the same run the schedule makes, at once, in the service's mode: a dry run while `DRY_RUN` is not `false`, live after go-live. The page follows the run and shows its result under Last run when it finishes. It works while the schedule is paused. The next scheduled run comes one interval after it started.
+- Runs never overlap. If a run takes longer than the interval, the next one starts when it finishes, and "Sync now" is refused while a run is in progress.
 - A run copies the records created or modified in HubSpot since the previous run (minus a five-minute overlap) into the staging database, then matches every record in staging. A record that misses an association on one run is picked up on the next.
 - Once every `FULL_REFRESH_HOURS` (default 24) a run copies everything again and re-reads every association from HubSpot. This is what notices records deleted or merged in HubSpot and associations removed by hand.
 
@@ -29,13 +32,13 @@ The service works only in HubSpot. It does not connect to Epicor or Jitterbit. I
 
 The start command, pre-deploy command, health check, restart policy, draining time and overlap time are settings on the middleware service in Railway, not files in the repository. Railway has deprecated `railway.json` (Config as Code) and ignores it on new services, so the repository has none. If the service is ever recreated, enter these values by hand in the service's settings before the first deploy; without them a deploy runs with no pre-deploy step and no health check.
 
-`DRY_RUN` controls whether the scheduled runs write. Leave it unset or `true` to watch what the service would do; set it to `false` to go live.
+`DRY_RUN` controls whether the service's runs write, scheduled or started with "Sync now". Leave it unset or `true` to watch what the service would do; set it to `false` to go live.
 
 On a deploy the old copy is told to stop and is given two minutes to finish its current run. If a run is cut off, its lock is taken over after `RUN_LOCK_STALE_MINUTES` (15); until then live runs report `skipped`.
 
 ## Where to look
 
-- **Admin page** (the service's public address): status and counts of the last run, alert settings, test alert, and changing the page's password.
+- **Admin page** (the service's public address): status and counts of the last run, "Sync now", the schedule, alert settings, test alert, and changing the page's password.
 - **Service log:** JSON lines in Railway under the service. Each run logs `run started`, one `rule processed` line per association with its counts, `deal amounts processed`, and `run finished` with the status.
 - **Last report:** `node src/cli.js report` in a shell on the service (`railway ssh`), or `report <run id>` for an earlier run.
 - **Staging database** (Railway's data view, or any Postgres client):
@@ -97,11 +100,11 @@ Why a record was not associated (`review_items.status`, and the unresolved CSV o
 
 Alert settings live on the admin page: on or off, email recipients, repeat interval, and a test button. Email goes through Resend and needs `RESEND_API_KEY` and `ALERT_EMAIL_FROM` (an address on a domain verified in Resend) as service variables. Slack needs `ALERT_SLACK_WEBHOOK_URL`. The page shows which channels are ready.
 
-- An alert is sent on the first scheduled run that fails or finishes with errors.
+- An alert is sent on the first run of the service, scheduled or started with "Sync now", that fails or finishes with errors.
 - While runs keep failing, the alert repeats at most once per repeat interval.
 - A "recovered" message is sent on the first good run after a failure.
 - With alerts switched off, or no channel set up, failures appear only in the log and on the admin page.
-- A command run by hand that fails sends its own alert and does not affect the scheduled runs' failing or recovered state.
+- A command run by hand in a shell that fails sends its own alert and does not affect the service's failing or recovered state.
 
 After changing a Resend or Slack variable, use "Send test alert" to confirm delivery. The result of each channel is shown on the page.
 
@@ -145,7 +148,7 @@ A held change that comes off the list is named in that run's report as applied o
 
 **The admin password is forgotten.** Give `ADMIN_PASSWORD` a new value in Railway (12 characters or more, and different from the value it has now). Railway redeploys the service, the service removes the password that was set on the page, and the new value of the variable is the password. The log line `service starting` then shows `adminSignIn: ADMIN_PASSWORD variable`, with a warning line saying the stored password was removed. Sign in with the new value and, if wanted, change the password on the page again. Saving the variable with the value it already has does nothing. The same reset can be done in the database with `DELETE FROM admin_password;`, after which the variable's current value signs in.
 
-**Running a full pass by hand.** Open a shell on the service (`railway ssh`) so the same variables and database are used, then `node src/cli.js reconcile` for a dry run or add `--apply`. A live manual run and the scheduled run cannot overlap; whichever starts second is skipped. Report files written in the container are lost on the next deploy; `node src/cli.js report` prints the stored report at any time.
+**Running a full pass by hand.** "Sync now" on the admin page is the ordinary incremental run; a full pass is a command. Open a shell on the service (`railway ssh`) so the same variables and database are used, then `node src/cli.js reconcile` for a dry run or add `--apply`. A live manual run and the scheduled run cannot overlap; whichever starts second is skipped. Report files written in the container are lost on the next deploy; `node src/cli.js report` prints the stored report at any time.
 
 **The staging database was lost or replaced.** Nothing in HubSpot is lost. Deploy (the pre-deploy step creates the tables) and the next run copies everything from HubSpot again. What does not come back: the run history, the review list (rebuilt by the next live run), alert settings (start again from `ALERT_EMAIL_TO`), the recorded quote amounts (every quote counts as seen for the first time, so an amount change made while the database was gone is not pushed to the deal), the record of which lines have arrived (no line counts as newly arrived until the first live run on the new database has finished), the list of held deal amount changes (the deals stay as they are; a held change is not listed again until that quote next changes amount, so export the query above before replacing the database), and the contact cleanup backup. Keep the cleanup's backup file somewhere safe for that reason, and turn on backups for the Postgres service in Railway.
 

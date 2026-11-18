@@ -538,6 +538,25 @@ export async function saveAlertState(db, { failing, lastAlertAt, lastSentAt = nu
   );
 }
 
+// ---- run schedule ----------------------------------------------------------
+
+/** The schedule saved on the admin page, or null while the RUN_INTERVAL_MINUTES variable applies. */
+export async function getScheduleSettings(db) {
+  const { rows } = await db.query('SELECT enabled, interval_minutes, updated_at FROM schedule_settings WHERE id = 1');
+  const row = rows[0];
+  return row ? { enabled: row.enabled, intervalMinutes: Number(row.interval_minutes), updatedAt: row.updated_at } : null;
+}
+
+export async function saveScheduleSettings(db, { enabled, intervalMinutes, now }) {
+  await db.query(
+    `INSERT INTO schedule_settings (id, enabled, interval_minutes, updated_at)
+     VALUES (1, $1, $2, $3::timestamptz)
+     ON CONFLICT (id) DO UPDATE SET enabled = EXCLUDED.enabled, interval_minutes = EXCLUDED.interval_minutes,
+       updated_at = EXCLUDED.updated_at`,
+    [Boolean(enabled), intervalMinutes, iso(now)],
+  );
+}
+
 // ---- admin page password ---------------------------------------------------
 
 /** The password set on the admin page, as hashes, or null while the ADMIN_PASSWORD variable is the password. */

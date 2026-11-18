@@ -99,7 +99,7 @@ To run the tests against a real Postgres server through the same driver the serv
 
 ## Deploying to Railway
 
-Nothing has been deployed and no repository or Railway project exists yet. The folder is ready to become the root of a new repository.
+The repository is `patch-ops-llc/industrious-data-patcher` on GitHub and the Railway project is `industrious-data-patcher` in the PatchOps workspace. The middleware service there is connected to the repository's `main` branch, so a push to `main` deploys. The steps below are how the project was set up, and how to set it up again.
 
 1. Create the repository and push this folder as its root (`package-lock.json` included; `.gitignore` keeps `node_modules`, `.env`, `reports/` and `data/` out).
 2. In a new Railway project add a **PostgreSQL** database service (New, Database, PostgreSQL). Keep its default name, `Postgres`.
@@ -248,11 +248,11 @@ A dry run lists the changes it would hold without recording them.
 
 - **Anything in Epicor or Jitterbit.** Item B4 and the Jitterbit mapping changes for the two Item B2 fields are being handled outside this service.
 - **Workflow changes.** Turning off the existing HubSpot association workflows is a manual step after validation.
-- **The repository and the Railway project.** Neither exists yet. `migrations/`, `.gitignore` and `.env.example` are ready.
+- **The repository and the Railway project** are not part of the build, but both now exist: repository `patch-ops-llc/industrious-data-patcher`, Railway project `industrious-data-patcher` in the PatchOps workspace. See "Deploying to Railway".
 - **Mapping editing in the admin page.** A later phase in the spec.
 
 ## Tested and not tested
 
 Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, and the admin page's sign-in and form protections. A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page was checked in Chrome. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
 
-Not tested: any write to the real portal; a live `reconcile` against the real portal; the amounts HubSpot's rollup really shows after lines are linked (the projection assumes the quote amount is the sum of its line amounts, which held for every quote with lines when the portal was read); the service running on Railway (only the build and the migrations have run there, the migrations against Railway's Postgres 18); delivery through the real Resend API or a real Slack webhook; `docker-compose.yml`.
+Not tested: any write to the real portal; a live `reconcile` against the real portal; the amounts HubSpot's rollup really shows after lines are linked (the projection assumes the quote amount is the sum of its line amounts, which held for every quote with lines when the portal was read); a live run on Railway (the build and the migrations have run there, the migrations against Railway's Postgres 18); delivery through the real Resend API or a real Slack webhook; `docker-compose.yml`.

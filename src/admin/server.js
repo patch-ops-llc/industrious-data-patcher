@@ -4,32 +4,53 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { sendTestAlert } from '../alerts.js';
 import { MAX_EMAIL_RECIPIENTS, parseEmailList } from '../config.js';
-import { getAlertSettings, getAlertState, lastRun, saveAlertSettings } from '../db/store.js';
+import { clearAdminPassword, getAdminPassword, getAlertSettings, getAlertState, lastRun, saveAdminPassword, saveAlertSettings } from '../db/store.js';
+import { hashPassword, verifyPassword } from './password.js';
 import { dashboardPage, loginPage, messagePage } from './views.js';
 
 /**
  * The admin page: alert control only.
  *
  * It can switch alerts on and off, set the email recipients and the repeat
- * interval, send a test alert, and show the last run's status. It has no
- * access to HubSpot: this module does not import the HubSpot client or the
- * run engine, so nothing on the page can write to HubSpot. Secrets (HubSpot
- * token, Resend key, Slack webhook, database URL, admin password) are never
- * rendered and no form field accepts one.
+ * interval, send a test alert, show the last run's status, and change its
+ * own password. It has no access to HubSpot: this module does not import the
+ * HubSpot client or the run engine, so nothing on the page can write to
+ * HubSpot. Secrets (HubSpot token, Resend key, Slack webhook, database URL,
+ * admin password) are never rendered, and the only secret a form field
+ * accepts is the admin password itself.
+ *
+ * The password is the ADMIN_PASSWORD service variable until it is changed on
+ * the page. From then on the staging database holds a salted hash of the new
+ * password and the variable no longer signs in. Giving the variable a new
+ * value removes the stored password, so the variable is the password again:
+ * that is the way back in when the password is forgotten.
  */
 
 export const MIN_PASSWORD_LENGTH = 12;
+const MAX_PASSWORD_LENGTH = 200;
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_REPEAT_MINUTES = 10_080;
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const MAX_FAILED_LOGINS = 10;
 const TEST_COOLDOWN_MS = 20_000;
 const MAX_SESSIONS = 100;
-const CSS = fs.readFileSync(fileURLToPath(new URL('./admin.css', import.meta.url)), 'utf8');
+
+const file = (name) => fs.readFileSync(fileURLToPath(new URL(name, import.meta.url)));
+const DAY_SECONDS = 86_400;
+// Everything the pages load. All of it is in the repository; nothing comes from another site.
+const ASSETS = {
+  '/assets/admin.css': { body: file('./admin.css'), type: 'text/css; charset=utf-8', maxAge: 300 },
+  '/assets/logo.svg': { body: file('./assets/logo.svg'), type: 'image/svg+xml', maxAge: DAY_SECONDS },
+  '/assets/gear.svg': { body: file('./assets/gear.svg'), type: 'image/svg+xml', maxAge: DAY_SECONDS },
+  '/assets/favicon.png': { body: file('./assets/favicon.png'), type: 'image/png', maxAge: DAY_SECONDS },
+  '/assets/apple-touch-icon.png': { body: file('./assets/apple-touch-icon.png'), type: 'image/png', maxAge: DAY_SECONDS },
+  '/assets/montserrat-latin.woff2': { body: file('./assets/montserrat-latin.woff2'), type: 'font/woff2', maxAge: DAY_SECONDS },
+};
 
 const NOTICES = {
   saved: 'Alert settings saved.',
   signed_out: 'You are signed out.',
+  password_changed: 'Password changed. Every other session was signed out.',
 };
 
 function sameSecret(a, b) {
@@ -94,12 +115,14 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
   const sessions = new Map();
   let failedLogins = [];
   let lastTestAt = 0;
+  // Whether ADMIN_PASSWORD is still the value a stored password was set under; worked out once per stored password.
+  let variableCheck = { hash: null, unchanged: false };
 
   function send(res, status, body, headers = {}) {
     res.writeHead(status, {
       'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-store',
-      'content-security-policy': "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      'content-security-policy': "default-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
       'x-content-type-options': 'nosniff',
       'x-frame-options': 'DENY',
       'referrer-policy': 'same-origin',
@@ -128,6 +151,45 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
     return { id, ...session };
   }
 
+  function startSession(at) {
+    for (const [id, session] of sessions) if (session.expiresAt <= at) sessions.delete(id);
+    while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
+    const id = crypto.randomBytes(32).toString('base64url');
+    sessions.set(id, { csrf: crypto.randomBytes(32).toString('base64url'), expiresAt: at + sessionMs });
+    return id;
+  }
+
+  /** How many wrong passwords (sign-in and change-password together) are inside the window. */
+  function recentFailures(at) {
+    failedLogins = failedLogins.filter((t) => at - t < LOGIN_WINDOW_MS);
+    return failedLogins.length;
+  }
+
+  /**
+   * The password set on the page, or null while the ADMIN_PASSWORD variable
+   * is the password. A stored password only stands while the variable still
+   * has the value it had when the password was changed: once the variable is
+   * given a new value the stored password is removed.
+   */
+  async function storedPassword() {
+    const stored = await getAdminPassword(db);
+    if (!stored) return null;
+    if (variableCheck.hash !== stored.variableHash) {
+      variableCheck = { hash: stored.variableHash, unchanged: await verifyPassword(password, stored.variableHash) };
+    }
+    if (variableCheck.unchanged) return stored;
+    if (await clearAdminPassword(db, { variableHash: stored.variableHash })) {
+      sessions.clear();
+      logger?.warn('ADMIN_PASSWORD has a new value: the password set on the admin page was removed and the variable is the password again');
+    }
+    return null;
+  }
+
+  async function passwordMatches(candidate) {
+    const stored = await storedPassword();
+    return stored ? verifyPassword(candidate, stored.passwordHash) : sameSecret(candidate, password);
+  }
+
   /**
    * A form post must come from this site. Browsers say where a request comes
    * from in Sec-Fetch-Site, which a page cannot set or change; older browsers
@@ -148,10 +210,11 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
   }
 
   async function renderDashboard(res, session, { status = 200, notice = null, error = null, form = null } = {}) {
-    const [alertSettings, alertState, run] = [
+    const [alertSettings, alertState, run, stored] = [
       await getAlertSettings(db),
       await getAlertState(db),
       await lastRun(db, { modes: ['incremental', 'full'] }),
+      await storedPassword(),
     ];
     if (run?.error) run.error = redact(run.error);
     if (alertState.lastResult) {
@@ -165,6 +228,7 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
       channels: alerter.status(alertSettings.emailRecipients),
       fromAddress: settings.alerts.emailFrom,
       service: { dryRun: settings.dryRun, intervalMinutes: settings.runIntervalMinutes },
+      password: { changedAt: stored ? stored.changedAt : null, minLength: MIN_PASSWORD_LENGTH, maxLength: MAX_PASSWORD_LENGTH },
       form,
       notice,
       error,
@@ -174,22 +238,50 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
 
   async function handleLogin(req, res) {
     const at = now().getTime();
-    failedLogins = failedLogins.filter((t) => at - t < LOGIN_WINDOW_MS);
-    if (failedLogins.length >= MAX_FAILED_LOGINS) {
+    if (recentFailures(at) >= MAX_FAILED_LOGINS) {
       return send(res, 429, loginPage({ error: 'Too many failed sign-in attempts. Try again in 15 minutes.' }), { 'retry-after': '900' });
     }
     const form = await readForm(req);
-    if (!sameSecret(form.get('password') || '', password)) {
+    if (!(await passwordMatches(form.get('password') || ''))) {
       failedLogins.push(at);
       logger?.warn('admin sign-in failed', { failedInWindow: failedLogins.length });
       return send(res, 401, loginPage({ error: 'That password is not correct.' }));
     }
-    for (const [id, session] of sessions) if (session.expiresAt <= at) sessions.delete(id);
-    while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
-    const id = crypto.randomBytes(32).toString('base64url');
-    sessions.set(id, { csrf: crypto.randomBytes(32).toString('base64url'), expiresAt: at + sessionMs });
+    const id = startSession(at);
     logger?.info('admin signed in');
     return redirect(res, '/', { 'set-cookie': sessionCookie(id, Math.floor(sessionMs / 1000)) });
+  }
+
+  async function handleChangePassword(req, res, session, form) {
+    const at = now().getTime();
+    const refuse = (status, reason) => renderDashboard(res, session, { status, error: `Password not changed. ${reason}` });
+    // Wrong current passwords count towards the same lock as wrong sign-ins, so a
+    // borrowed session cannot be used to guess the password.
+    if (recentFailures(at) >= MAX_FAILED_LOGINS) return refuse(429, 'Too many wrong passwords. Try again in 15 minutes.');
+
+    const current = form.get('current_password') || '';
+    const next = form.get('new_password') || '';
+    const confirm = form.get('confirm_password') || '';
+    if (!(await passwordMatches(current))) {
+      failedLogins.push(at);
+      logger?.warn('admin password change refused: the current password was wrong', { failedInWindow: failedLogins.length });
+      return refuse(403, 'The current password is not correct.');
+    }
+    if (next.length < MIN_PASSWORD_LENGTH) return refuse(400, `The new password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+    if (next.length > MAX_PASSWORD_LENGTH) return refuse(400, `The new password can be at most ${MAX_PASSWORD_LENGTH} characters.`);
+    if (next !== confirm) return refuse(400, 'The new password and its confirmation are not the same.');
+    if (next === current) return refuse(400, 'The new password must differ from the current one.');
+
+    const variableHash = await hashPassword(password);
+    await saveAdminPassword(db, { passwordHash: await hashPassword(next), variableHash, now: now() });
+    variableCheck = { hash: variableHash, unchanged: true };
+
+    // Everyone is signed out, and this browser gets a fresh session.
+    const others = sessions.size - 1;
+    sessions.clear();
+    const id = startSession(at);
+    logger?.info('admin password changed on the admin page', { otherSessionsSignedOut: others });
+    return redirect(res, '/?notice=password_changed', { 'set-cookie': sessionCookie(id, Math.floor(sessionMs / 1000)) });
   }
 
   async function handleSaveAlerts(req, res, session, form) {
@@ -238,8 +330,9 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
     if (path === '/healthz' && (method === 'GET' || method === 'HEAD')) {
       return send(res, 200, method === 'HEAD' ? '' : '{"status":"ok"}', { 'content-type': 'application/json' });
     }
-    if (path === '/assets/admin.css' && method === 'GET') {
-      return send(res, 200, CSS, { 'content-type': 'text/css; charset=utf-8', 'cache-control': 'public, max-age=300' });
+    if (method === 'GET' && Object.hasOwn(ASSETS, path)) {
+      const asset = ASSETS[path];
+      return send(res, 200, asset.body, { 'content-type': asset.type, 'cache-control': `public, max-age=${asset.maxAge}` });
     }
     if (path === '/robots.txt' && method === 'GET') {
       return send(res, 200, 'User-agent: *\nDisallow: /\n', { 'content-type': 'text/plain; charset=utf-8' });
@@ -280,6 +373,7 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
     }
     if (path === '/alerts') return handleSaveAlerts(req, res, session, form);
     if (path === '/alerts/test') return handleTestAlert(req, res, session);
+    if (path === '/password') return handleChangePassword(req, res, session, form);
     return send(res, 404, messagePage('Not found', 'There is no page at this address.'));
   }
 
@@ -301,6 +395,15 @@ export function createAdminServer({ db, settings, alerter, logger, now = () => n
   return {
     enabled,
     server,
+    /**
+     * Where the password comes from right now: 'page' (set on the admin page)
+     * or 'variable' (ADMIN_PASSWORD). Also applies the recovery rule, so a new
+     * ADMIN_PASSWORD value takes effect as soon as the service starts.
+     */
+    async passwordSource() {
+      if (!enabled) return 'off';
+      return (await storedPassword()) ? 'page' : 'variable';
+    },
     listen(port, host) {
       return new Promise((resolve, reject) => {
         server.once('error', reject);

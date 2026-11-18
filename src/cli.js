@@ -170,12 +170,15 @@ async function commandStart(cli) {
   const address = await admin.listen(settings.port);
   const alertSettings = await getAlertSettings(db);
   const channels = alerter.status(alertSettings.emailRecipients);
+  // Also applies the recovery rule: a new ADMIN_PASSWORD value replaces a password set on the page.
+  const signInWith = await admin.passwordSource();
 
   logger.info('service starting', {
     intervalMinutes: settings.runIntervalMinutes,
     dryRun: settings.dryRun,
     port: address.port,
     adminPage: admin.enabled ? 'on' : 'off',
+    adminSignIn: signInWith === 'page' ? 'password set on the admin page' : signInWith === 'variable' ? 'ADMIN_PASSWORD variable' : 'off',
     alertsEnabled: alertSettings.enabled,
     alertEmail: channels.email,
     alertSlack: channels.slack,

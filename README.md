@@ -61,6 +61,7 @@ Postgres, on Railway next to the service. It replaces the state file of the earl
 | `deal_amount_holds` | Item B3: deal amount changes held for review by the guard, with the deal, the quote and the amount before and after |
 | `contact_cleanup_removals` | Item B2 cleanup: every association removed, for restore |
 | `alert_settings`, `alert_state` | Alert switch, recipients, repeat interval; whether runs are currently failing |
+| `admin_password` | The admin page password once it has been changed on the page, as salted hashes only. Empty while `ADMIN_PASSWORD` is the password |
 | `run_lock` | Stops two live runs from writing at the same time |
 
 HubSpot stays the authority. Before creating anything the service re-reads the associations of the records involved from HubSpot, and every `FULL_REFRESH_HOURS` it re-reads everything. If the database is lost, the next run rebuilds the staging copy from HubSpot; see the runbook for what else is affected.
@@ -110,7 +111,7 @@ The repository is `patch-ops-llc/industrious-data-patcher` on GitHub and the Rai
 | --- | --- |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` (a reference to the database service; the private network needs no SSL) |
 | `HUBSPOT_PRIVATE_APP_TOKEN` | The private app token |
-| `ADMIN_PASSWORD` | A long password for the admin page (12 characters or more) |
+| `ADMIN_PASSWORD` | The starting password for the admin page (12 characters or more). It can be changed on the page afterwards; giving this variable a new value resets it. See "The admin page" |
 | `DRY_RUN` | Leave unset (dry run) until go-live, then `false` |
 | `RESEND_API_KEY`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | For email alerts. `ALERT_EMAIL_TO` is only the starting list; recipients are edited on the admin page afterwards |
 | `ALERT_SLACK_WEBHOOK_URL` | Optional, for Slack alerts |
@@ -183,13 +184,24 @@ Editing mappings in a web page is a later phase in the spec and is not built.
 - turn alerts on and off,
 - set the email recipients and the repeat interval,
 - send a test alert,
-- see the status and counts of the last run.
+- see the status and counts of the last run,
+- change the page's own password.
 
 These settings are stored in the staging database, so they survive restarts and deploys.
 
-What it does not do, by design: it has no control that writes to HubSpot, cannot start a run, cannot switch dry run on or off, cannot edit mappings, and never shows or accepts the HubSpot token, the Resend key, the Slack webhook, the database address or the password. Those are service variables. The admin code does not load the HubSpot client at all.
+What it does not do, by design: it has no control that writes to HubSpot, cannot start a run, cannot switch dry run on or off, cannot edit mappings, and never shows the HubSpot token, the Resend key, the Slack webhook, the database address or the password. Those are service variables, and the only secret a form on the page accepts is the page's own password. The admin code does not load the HubSpot client at all.
 
-Sign-in is one password, `ADMIN_PASSWORD` (12 characters or more). Without it the page is switched off and answers 503; the service and the health check keep running. Ten wrong passwords within 15 minutes lock sign-in, for everyone, until they age out. Sessions last `ADMIN_SESSION_HOURS` (12) and end when the service restarts. The page uses no JavaScript and sets strict browser security headers. There is one shared password, not individual accounts.
+Sign-in is one shared password, not individual accounts. Ten wrong passwords within 15 minutes, at sign-in or as the current password on the change form, lock both for everyone until they age out. Sessions last `ADMIN_SESSION_HOURS` (12) and end when the service restarts.
+
+**The password.**
+
+- It starts as the `ADMIN_PASSWORD` service variable (12 characters or more). Without that variable the page is switched off and answers 503; the service and the health check keep running.
+- It can be changed on the page: current password, new password (12 characters or more), and the new one again. The staging database then holds a salted scrypt hash of the new password (table `admin_password`) and never the password itself. Every other session is signed out.
+- Once it has been changed on the page, the value of `ADMIN_PASSWORD` no longer signs in. Keep the variable set all the same: removing it switches the page off.
+- **Recovery, if the password is forgotten:** give `ADMIN_PASSWORD` a new value in Railway, different from the one it has. The service restarts, sees that the variable is no longer the value it was when the password was changed, removes the stored password, and the variable's new value is the password again. Setting the variable to the value it already has changes nothing.
+- Recovery needs access to the Railway project, which already holds every other secret of the service, so it opens no new way in. The service log says at start which of the two is in use (`adminSignIn`), and logs a warning when a reset happens. No password or hash is ever logged or shown.
+
+**The look.** The pages carry the Industrious Group branding from industriousgroup.com: the logo, the orange and charcoal, heavy headings in capitals. The site's typeface, Proxima Nova, is licensed through Adobe Fonts and cannot be redistributed, so the pages use Montserrat (SIL Open Font License), the closest open typeface. The logo, the icons and the font are in `src/admin/assets/` and are served by the service; the pages load nothing from another site, use no JavaScript, and set strict browser security headers (the content security policy allows styles, images and fonts from the service itself and nothing else).
 
 ## Alerts
 
@@ -253,6 +265,6 @@ A dry run lists the changes it would hold without recording them.
 
 ## Tested and not tested
 
-Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, and the admin page's sign-in and form protections. A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page was checked in Chrome. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
+Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, the admin page's sign-in and form protections, and changing and recovering the admin password. A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page, including the password change, was checked in Chrome at desktop and phone widths against a local run with the stand-in HubSpot. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
 
 Not tested: any write to the real portal; a live `reconcile` against the real portal; the amounts HubSpot's rollup really shows after lines are linked (the projection assumes the quote amount is the sum of its line amounts, which held for every quote with lines when the portal was read); a live run on Railway (the build and the migrations have run there, the migrations against Railway's Postgres 18); delivery through the real Resend API or a real Slack webhook; `docker-compose.yml`.

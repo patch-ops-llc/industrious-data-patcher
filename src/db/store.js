@@ -538,6 +538,31 @@ export async function saveAlertState(db, { failing, lastAlertAt, lastSentAt = nu
   );
 }
 
+// ---- admin page password ---------------------------------------------------
+
+/** The password set on the admin page, as hashes, or null while the ADMIN_PASSWORD variable is the password. */
+export async function getAdminPassword(db) {
+  const { rows } = await db.query('SELECT password_hash, variable_hash, changed_at FROM admin_password WHERE id = 1');
+  const row = rows[0];
+  return row ? { passwordHash: row.password_hash, variableHash: row.variable_hash, changedAt: row.changed_at } : null;
+}
+
+export async function saveAdminPassword(db, { passwordHash, variableHash, now }) {
+  await db.query(
+    `INSERT INTO admin_password (id, password_hash, variable_hash, changed_at)
+     VALUES (1, $1, $2, $3::timestamptz)
+     ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, variable_hash = EXCLUDED.variable_hash,
+       changed_at = EXCLUDED.changed_at`,
+    [passwordHash, variableHash, iso(now)],
+  );
+}
+
+/** Removes the stored password that was set under the given variable hash, and no newer one. */
+export async function clearAdminPassword(db, { variableHash }) {
+  const { rowCount } = await db.query('DELETE FROM admin_password WHERE id = 1 AND variable_hash = $1', [variableHash]);
+  return rowCount > 0;
+}
+
 // ---- contact cleanup backup (Item B2) --------------------------------------
 
 /** rows: [{ headerId, headerKey, fromType, toType, toId, types, result }] */

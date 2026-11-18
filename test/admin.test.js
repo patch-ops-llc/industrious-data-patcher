@@ -3,10 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { hashPassword, verifyPassword } from '../src/admin/password.js';
 import { createAdminServer } from '../src/admin/server.js';
 import { createAlerter } from '../src/alerts.js';
 import { loadSettings } from '../src/config.js';
-import { getAlertSettings, getAlertState, saveAlertSettings } from '../src/db/store.js';
+import { getAdminPassword, getAlertSettings, getAlertState, saveAlertSettings } from '../src/db/store.js';
 import { executeRun } from '../src/engine/run.js';
 import { addQuoteFamily, makeHarness, T } from './helpers.js';
 
@@ -68,14 +69,31 @@ async function startAdmin(h, { env = {}, fetchImpl, now } = {}) {
   return { admin, base, request, login, sent, bodies, settings, close: async () => { openServers.delete(admin); await admin.close(); } };
 }
 
-test('admin: nothing but the health check, the stylesheet and the sign-in page is reachable without signing in', async () => {
+test('admin: nothing but the health check, the page assets and the sign-in page is reachable without signing in', async () => {
   const h = await makeHarness();
   const a = await startAdmin(h);
 
   const health = await a.request('GET', '/healthz');
   assert.equal(health.status, 200);
   assert.equal(health.text, '{"status":"ok"}');
-  assert.equal((await a.request('GET', '/assets/admin.css')).status, 200);
+  // The stylesheet, logo, icons and font the pages use are served by the service itself.
+  const assets = {
+    '/assets/admin.css': 'text/css; charset=utf-8',
+    '/assets/logo.svg': 'image/svg+xml',
+    '/assets/gear.svg': 'image/svg+xml',
+    '/assets/favicon.png': 'image/png',
+    '/assets/apple-touch-icon.png': 'image/png',
+    '/assets/montserrat-latin.woff2': 'font/woff2',
+  };
+  for (const [url, type] of Object.entries(assets)) {
+    const asset = await a.request('GET', url);
+    assert.equal(asset.status, 200, url);
+    assert.equal(asset.headers.get('content-type'), type, url);
+    assert.equal(asset.headers.get('x-content-type-options'), 'nosniff', url);
+  }
+  for (const url of ['/assets/', '/assets/admin.css/', '/assets/../server.js', '/assets/%2e%2e/server.js', '/assets/montserrat-OFL.txt', '/assets/password.js']) {
+    assert.notEqual((await a.request('GET', url)).status, 200, url);
+  }
 
   const home = await a.request('GET', '/');
   assert.equal(home.status, 303);
@@ -96,12 +114,32 @@ test('admin: nothing but the health check, the stylesheet and the sign-in page i
   for (const response of [home, loginPage, health]) {
     assert.equal(response.headers.get('x-frame-options'), 'DENY');
     assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
-    assert.match(response.headers.get('content-security-policy'), /default-src 'none'/);
-    assert.match(response.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    // Nothing may load from anywhere but this service, and no script at all.
+    assert.equal(
+      response.headers.get('content-security-policy'),
+      "default-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    );
     assert.equal(response.headers.get('referrer-policy'), 'same-origin');
   }
   assert.equal(loginPage.headers.get('cache-control'), 'no-store');
   assert.doesNotMatch(loginPage.text, /<script/i);
+
+  // The branding is bundled: the pages and the stylesheet point at no other site.
+  const { cookie } = await a.login();
+  const dashboard = await a.request('GET', '/', { cookie });
+  const stylesheet = await a.request('GET', '/assets/admin.css');
+  for (const [name, text] of [['sign-in page', loginPage.text], ['admin page', dashboard.text], ['stylesheet', stylesheet.text]]) {
+    assert.doesNotMatch(text, /https?:\/\/|url\(\s*["']?\/\//i, name);
+  }
+  for (const page of [loginPage.text, dashboard.text]) {
+    assert.match(page, /<img class="logo" src="\/assets\/logo\.svg" alt="Industrious Group"/);
+    assert.match(page, /<link rel="stylesheet" href="\/assets\/admin\.css\?v=[0-9a-f]{12}">/);
+    assert.doesNotMatch(page, /style=|<style/i);
+  }
+  const used = [...stylesheet.text.matchAll(/url\("([^"]+)"\)/g)].map((m) => m[1]);
+  assert.ok(used.length > 0 && used.every((url) => Object.hasOwn(assets, url)), used.join(' '));
+  // Headings are set in capitals by the stylesheet, not typed in capitals.
+  assert.match(stylesheet.text, /h1, h2 \{[^}]*text-transform: uppercase/);
   await a.close();
   await h.cleanup();
 });
@@ -343,8 +381,9 @@ test('admin: the page shows the last run status and never contains a secret, eve
   await executeRun(h.ctx({ dryRun: true }), { mode: 'incremental' });
   let page = await a.request('GET', '/', { cookie });
   assert.match(page.text, /<span class="badge good">OK<\/span> <span class="badge info">Dry run<\/span>/);
-  assert.match(page.text, /<td>Lines to header<\/td><td class="num">3<\/td><td class="num">2<\/td><td class="num">1<\/td><td class="num">0<\/td><td class="num">0<\/td>/);
+  assert.match(page.text, /<td>Lines to header<\/td><td class="num" data-label="Checked">3<\/td><td class="num" data-label="Would fill">2<\/td><td class="num" data-label="No match">1<\/td><td class="num" data-label="Held for review">0<\/td><td class="num" data-label="Failed">0<\/td>/);
   assert.match(page.text, /Would fill/);
+  assert.match(page.text, /<p class="stat-label">Held for review<\/p>\n<p class="stat-value">0<\/p>/);
   assert.match(page.text, /Live: scheduled runs write to HubSpot/);
   assert.match(page.text, /Every 30 minutes/);
 
@@ -363,6 +402,7 @@ test('admin: the page shows the last run status and never contains a secret, eve
   await executeRun(h.ctx(), { mode: 'incremental' });
   page = await a.request('GET', '/', { cookie });
   assert.match(page.text, /Deal amounts: 0 updated, 1 held for review, 0 failed\./);
+  assert.match(page.text, /<div class="stat warn">\n<p class="stat-label">Held for review<\/p>\n<p class="stat-value">1<\/p>\n<p class="stat-note">0 associations, 1 deal amount<\/p>/);
 
   // A failed run whose error text happens to contain secrets and markup.
   fake.advance(30);
@@ -389,9 +429,11 @@ test('admin: the page shows the last run status and never contains a secret, eve
   for (const fragment of ['HUBSPOT-SECRET', 'RESEND-SECRET', 'SLACK-SECRET', 'DB-SECRET', 'hooks.slack.test', 'db.internal']) {
     assert.ok(!everything.includes(fragment), fragment);
   }
-  // No field asks for a secret: the only inputs are the password box, the session token and the three alert fields.
+  // No field asks for any other secret: the only inputs are the password boxes, the session token and the three alert fields.
   const inputs = [...everything.matchAll(/<(?:input|textarea|select)[^>]*name="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual([...new Set(inputs)].sort(), ['csrf', 'enabled', 'password', 'recipients', 'repeat_minutes']);
+  assert.deepEqual([...new Set(inputs)].sort(), ['confirm_password', 'csrf', 'current_password', 'enabled', 'new_password', 'password', 'recipients', 'repeat_minutes']);
+  // Password boxes are never filled in by the server.
+  assert.doesNotMatch(everything, /<input[^>]*type="password"[^>]*value=/);
   assert.ok(orphan);
   await a.close();
   await h.cleanup();
@@ -415,10 +457,11 @@ test('admin: nothing on the page can write to HubSpot', async () => {
   assert.equal(fake.requests.length, 0, 'the admin page never calls HubSpot');
   assert.equal(await h.count('runs'), 0);
 
-  // The page has exactly three forms, and none of them is about runs or mappings.
+  // The page has exactly four forms, and none of them is about runs or mappings.
   const page = await a.request('GET', '/', { cookie });
   const actions = [...page.text.matchAll(/<form method="post" action="([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(actions, ['/alerts', '/alerts/test', '/logout']);
+  assert.deepEqual(actions, ['/alerts', '/alerts/test', '/logout', '/password']);
+  assert.equal((page.text.match(/<form/g) || []).length, 4);
   assert.doesNotMatch(page.text, /<a\s/i);
 
   // The admin code has no way to reach HubSpot: it imports neither the HubSpot client nor the run engine.
@@ -450,5 +493,229 @@ test('admin: settings saved in the page are what the alerting uses, and they sur
   // Sessions are kept in memory: the old cookie does not work on the restarted service.
   assert.equal((await b.request('GET', '/', { cookie })).status, 303);
   await b.close();
+  await h.cleanup();
+});
+
+// ---- changing the password on the page ----------------------------------------
+
+const NEW_PASSWORD = 'a brand new passphrase 2026';
+const browser = (a) => ({ origin: a.base, 'sec-fetch-site': 'same-origin' });
+
+/** Fails if any password, or any stored hash, was sent to a browser or written to the log. */
+async function assertNoPasswordLeak(h, a, passwords) {
+  const stored = await getAdminPassword(h.db);
+  const hashes = stored ? [stored.passwordHash, stored.variableHash, ...stored.passwordHash.split('$').slice(4), ...stored.variableHash.split('$').slice(4)] : [];
+  const sent = a.bodies.join('\n');
+  const logged = JSON.stringify(h.logs);
+  for (const value of [...passwords, ...hashes]) {
+    assert.ok(!sent.includes(value), 'a password or its hash was sent to the browser');
+    assert.ok(!sent.includes(encodeURIComponent(value)), 'a password or its hash was sent to the browser');
+    assert.ok(!logged.includes(value), 'a password or its hash was written to the log');
+  }
+  assert.doesNotMatch(sent, /scrypt\$/);
+  assert.doesNotMatch(logged, /scrypt\$/);
+}
+
+test('admin password: hashes are salted scrypt, verify only the right password, and a damaged hash matches nothing', async () => {
+  const one = await hashPassword(NEW_PASSWORD);
+  const two = await hashPassword(NEW_PASSWORD);
+  assert.match(one, /^scrypt\$32768\$8\$1\$[A-Za-z0-9+/=]{24}\$[A-Za-z0-9+/=]{44}$/);
+  assert.notEqual(one, two, 'every hash has its own salt');
+  assert.ok(!one.includes(NEW_PASSWORD));
+  assert.equal(await verifyPassword(NEW_PASSWORD, one), true);
+  assert.equal(await verifyPassword(NEW_PASSWORD, two), true);
+  assert.equal(await verifyPassword(`${NEW_PASSWORD} `, one), false);
+  assert.equal(await verifyPassword('', one), false);
+  for (const damaged of ['', null, undefined, NEW_PASSWORD, 'scrypt$32768$8$1$$', one.replace('scrypt', 'md5'), one.replace('$32768$', '$0$'), one.replace('$32768$', '$1000$'), one.replace('$32768$', '$1073741824$'), `${one}$extra`]) {
+    assert.equal(await verifyPassword(NEW_PASSWORD, damaged), false, String(damaged).slice(0, 30));
+  }
+});
+
+test('admin password: a wrong current password, a short new one or a mismatched confirmation is refused and nothing changes', async () => {
+  const h = await makeHarness();
+  const a = await startAdmin(h);
+  const { cookie, csrf } = await a.login();
+  const good = { csrf, current_password: SECRETS.ADMIN_PASSWORD, new_password: NEW_PASSWORD, confirm_password: NEW_PASSWORD };
+
+  const refused = [
+    [403, /Password not changed\. The current password is not correct\./, { ...good, current_password: 'not the current password' }],
+    [403, /The current password is not correct\./, { ...good, current_password: '' }],
+    [403, /The current password is not correct\./, { ...good, current_password: NEW_PASSWORD }],
+    [400, /Password not changed\. The new password must be at least 12 characters\./, { ...good, new_password: 'elevenchars', confirm_password: 'elevenchars' }],
+    [400, /at least 12 characters/, { ...good, new_password: '', confirm_password: '' }],
+    [400, /at most 200 characters/, { ...good, new_password: 'x'.repeat(201), confirm_password: 'x'.repeat(201) }],
+    [400, /The new password and its confirmation are not the same\./, { ...good, confirm_password: `${NEW_PASSWORD}!` }],
+    [400, /The new password and its confirmation are not the same\./, { ...good, confirm_password: '' }],
+    [400, /The new password must differ from the current one\./, { ...good, new_password: SECRETS.ADMIN_PASSWORD, confirm_password: SECRETS.ADMIN_PASSWORD }],
+  ];
+  for (const [status, message, form] of refused) {
+    const response = await a.request('POST', '/password', { cookie, form, headers: browser(a) });
+    assert.equal(response.status, status, String(message));
+    assert.match(response.text, message);
+    assert.equal(response.headers.get('set-cookie'), null);
+    assert.match(response.text, /This is still the starting password/);
+  }
+
+  // The form is protected like the others: session, session token, same site.
+  assert.equal((await a.request('POST', '/password', { form: good })).status, 401);
+  assert.equal((await a.request('POST', '/password', { cookie, form: { ...good, csrf: 'guess' } })).status, 403);
+  assert.equal((await a.request('POST', '/password', { cookie, form: { ...good, csrf: '' } })).status, 403);
+  assert.equal((await a.request('POST', '/password', { cookie, form: good, headers: { origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await a.request('POST', '/password', { cookie, form: good, headers: { 'sec-fetch-site': 'cross-site' } })).status, 403);
+  assert.equal((await a.request('GET', '/password', { cookie })).status, 404);
+
+  assert.equal(await getAdminPassword(h.db), null);
+  assert.equal(await h.count('admin_password'), 0);
+  assert.equal(await a.admin.passwordSource(), 'variable');
+  // Still signed in, and the starting password still works.
+  assert.equal((await a.request('GET', '/', { cookie })).status, 200);
+  assert.equal((await a.login()).response.status, 303);
+  assert.equal((await a.login(NEW_PASSWORD)).response.status, 401);
+
+  assert.ok(h.logs.some((l) => l.level === 'warn' && /password change refused/.test(l.msg)));
+  await assertNoPasswordLeak(h, a, [SECRETS.ADMIN_PASSWORD, NEW_PASSWORD, 'not the current password', 'elevenchars']);
+  await a.close();
+  await h.cleanup();
+});
+
+test('admin password: changing it stores only a salted hash, signs out every other session, and retires ADMIN_PASSWORD', async () => {
+  const h = await makeHarness();
+  const a = await startAdmin(h);
+  const mine = await a.login();
+  const other = await a.login();
+  assert.equal((await a.request('GET', '/', { cookie: other.cookie })).status, 200);
+
+  const changed = await a.request('POST', '/password', {
+    cookie: mine.cookie,
+    form: { csrf: mine.csrf, current_password: SECRETS.ADMIN_PASSWORD, new_password: NEW_PASSWORD, confirm_password: NEW_PASSWORD },
+    headers: browser(a),
+  });
+  assert.equal(changed.status, 303);
+  assert.equal(changed.headers.get('location'), '/?notice=password_changed');
+  assert.match(changed.headers.get('set-cookie'), /^__Host-ia_admin=[A-Za-z0-9_-]{40,}; Path=\/; HttpOnly; SameSite=Strict; Max-Age=43200; Secure$/);
+  const fresh = changed.headers.get('set-cookie').split(';')[0];
+  assert.notEqual(fresh, mine.cookie);
+
+  // The other session is signed out, and so is the old cookie of the one that made the change.
+  assert.equal((await a.request('GET', '/', { cookie: other.cookie })).status, 303);
+  assert.equal((await a.request('GET', '/', { cookie: mine.cookie })).status, 303);
+  assert.equal((await a.request('POST', '/alerts', { cookie: other.cookie, form: { csrf: other.csrf, enabled: '1', recipients: 'x@example.com', repeat_minutes: '5' } })).status, 401);
+  const page = await a.request('GET', '/?notice=password_changed', { cookie: fresh });
+  assert.equal(page.status, 200);
+  assert.match(page.text, /Password changed\. Every other session was signed out\./);
+  assert.match(page.text, /Set on this page on \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. The ADMIN_PASSWORD service variable no longer signs in\./);
+  // The old session token is gone with the old session.
+  const freshCsrf = page.text.match(/name="csrf" value="([^"]+)"/)[1];
+  assert.notEqual(freshCsrf, mine.csrf);
+
+  // Only hashes are in the staging database.
+  const { rows } = await h.db.query('SELECT * FROM admin_password');
+  assert.equal(rows.length, 1);
+  const row = JSON.stringify(rows[0]);
+  assert.ok(!row.includes(NEW_PASSWORD) && !row.includes(SECRETS.ADMIN_PASSWORD));
+  assert.match(rows[0].password_hash, /^scrypt\$32768\$8\$1\$/);
+  assert.match(rows[0].variable_hash, /^scrypt\$32768\$8\$1\$/);
+  assert.notEqual(rows[0].password_hash.split('$')[4], rows[0].variable_hash.split('$')[4], 'each hash has its own salt');
+  assert.equal(await verifyPassword(NEW_PASSWORD, rows[0].password_hash), true);
+  assert.equal(await verifyPassword(SECRETS.ADMIN_PASSWORD, rows[0].password_hash), false);
+  assert.equal(await a.admin.passwordSource(), 'page');
+
+  // The variable's value no longer signs in; the new password does.
+  const old = await a.login();
+  assert.equal(old.response.status, 401);
+  assert.equal(old.setCookie, null);
+  assert.equal((await a.login(NEW_PASSWORD)).response.status, 303);
+
+  // The variable's value is no longer the current password for a second change either.
+  const second = { csrf: freshCsrf, current_password: SECRETS.ADMIN_PASSWORD, new_password: 'yet another passphrase', confirm_password: 'yet another passphrase' };
+  assert.equal((await a.request('POST', '/password', { cookie: fresh, form: second })).status, 403);
+  const again = await a.request('POST', '/password', { cookie: fresh, form: { ...second, current_password: NEW_PASSWORD } });
+  assert.equal(again.status, 303);
+  assert.equal((await a.login(NEW_PASSWORD)).response.status, 401);
+  assert.equal((await a.login('yet another passphrase')).response.status, 303);
+  assert.equal(await h.count('admin_password'), 1);
+
+  assert.ok(h.logs.some((l) => l.msg === 'admin password changed on the admin page' && l.otherSessionsSignedOut === 1));
+  await assertNoPasswordLeak(h, a, [SECRETS.ADMIN_PASSWORD, NEW_PASSWORD, 'yet another passphrase']);
+  // Nothing the page does reaches HubSpot.
+  assert.equal(h.fake.requests.length, 0);
+  await a.close();
+  await h.cleanup();
+});
+
+test('admin password: it survives a restart, and giving ADMIN_PASSWORD a new value resets it to the variable', async () => {
+  const h = await makeHarness();
+  const a = await startAdmin(h);
+  const { cookie, csrf } = await a.login();
+  const changed = await a.request('POST', '/password', { cookie, form: { csrf, current_password: SECRETS.ADMIN_PASSWORD, new_password: NEW_PASSWORD, confirm_password: NEW_PASSWORD } });
+  assert.equal(changed.status, 303);
+  await a.close();
+
+  // Restart with the variable unchanged: the page password stands, the variable does not sign in.
+  const b = await startAdmin(h);
+  assert.equal(await b.admin.passwordSource(), 'page');
+  assert.equal((await b.login()).response.status, 401);
+  assert.equal((await b.login(NEW_PASSWORD)).response.status, 303);
+  assert.equal(await h.count('admin_password'), 1);
+  await b.close();
+
+  // Recovery: the variable is given a new value. The stored password is removed and the variable is the password again.
+  const RECOVERY = 'recovery value set in railway';
+  const c = await startAdmin(h, { env: { ADMIN_PASSWORD: RECOVERY } });
+  assert.equal(await c.admin.passwordSource(), 'variable');
+  assert.equal(await h.count('admin_password'), 0);
+  assert.equal((await c.login(NEW_PASSWORD)).response.status, 401);
+  assert.equal((await c.login()).response.status, 401, 'the old variable value does not come back either');
+  const recovered = await c.login(RECOVERY);
+  assert.equal(recovered.response.status, 303);
+  assert.match((await c.request('GET', '/', { cookie: recovered.cookie })).text, /This is still the starting password/);
+  assert.ok(h.logs.some((l) => l.level === 'warn' && /ADMIN_PASSWORD has a new value/.test(l.msg)));
+
+  // From there the password can be changed on the page again, and that holds across a restart.
+  const next = await c.request('POST', '/password', { cookie: recovered.cookie, form: { csrf: recovered.csrf, current_password: RECOVERY, new_password: 'third passphrase here', confirm_password: 'third passphrase here' } });
+  assert.equal(next.status, 303);
+  await assertNoPasswordLeak(h, c, [SECRETS.ADMIN_PASSWORD, NEW_PASSWORD, RECOVERY, 'third passphrase here']);
+  await c.close();
+  const d = await startAdmin(h, { env: { ADMIN_PASSWORD: RECOVERY } });
+  assert.equal((await d.login(RECOVERY)).response.status, 401);
+  assert.equal((await d.login('third passphrase here')).response.status, 303);
+  await d.close();
+
+  // Recovery also works without anyone visiting the page first: signing in applies it.
+  const e = await startAdmin(h, { env: { ADMIN_PASSWORD: 'second recovery value' } });
+  assert.equal((await e.login('third passphrase here')).response.status, 401);
+  assert.equal(await h.count('admin_password'), 0);
+  assert.equal((await e.login('second recovery value')).response.status, 303);
+  await e.close();
+
+  // Without a usable ADMIN_PASSWORD the page stays off, whatever is stored.
+  const f = await startAdmin(h, { env: { ADMIN_PASSWORD: '' } });
+  assert.equal(await f.admin.passwordSource(), 'off');
+  assert.equal((await f.request('POST', '/login', { form: { password: 'third passphrase here' } })).status, 503);
+  await f.close();
+  await h.cleanup();
+});
+
+test('admin password: wrong current passwords count towards the sign-in lock', async () => {
+  const h = await makeHarness();
+  let clock = Date.parse('2026-11-18T10:00:00Z');
+  const a = await startAdmin(h, { now: () => new Date(clock) });
+  const { cookie, csrf } = await a.login();
+  const form = { csrf, new_password: NEW_PASSWORD, confirm_password: NEW_PASSWORD };
+
+  for (let i = 0; i < 10; i += 1) {
+    assert.equal((await a.request('POST', '/password', { cookie, form: { ...form, current_password: `guess number ${i}` } })).status, 403);
+  }
+  // Locked now, even with the right current password, and for signing in too.
+  const locked = await a.request('POST', '/password', { cookie, form: { ...form, current_password: SECRETS.ADMIN_PASSWORD } });
+  assert.equal(locked.status, 429);
+  assert.match(locked.text, /Password not changed\. Too many wrong passwords\./);
+  assert.equal((await a.login()).response.status, 429);
+  assert.equal(await h.count('admin_password'), 0);
+
+  clock += 16 * 60_000;
+  assert.equal((await a.request('POST', '/password', { cookie, form: { ...form, current_password: SECRETS.ADMIN_PASSWORD } })).status, 303);
+  assert.equal(await h.count('admin_password'), 1);
+  await a.close();
   await h.cleanup();
 });

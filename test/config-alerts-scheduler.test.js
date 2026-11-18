@@ -212,7 +212,7 @@ test('staging database: migrations create every table once, are safe to repeat, 
 
   const tables = (await db.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() ORDER BY 1`)).rows.map((r) => r.table_name);
   assert.deepEqual(tables, [
-    'alert_settings', 'alert_state', 'association_actions', 'contact_cleanup_removals', 'deal_amount_baselines', 'deal_amount_holds', 'ingest_cursors',
+    'admin_password', 'alert_settings', 'alert_state', 'association_actions', 'contact_cleanup_removals', 'deal_amount_baselines', 'deal_amount_holds', 'ingest_cursors',
     'review_items', 'run_lock', 'runs', 'schema_migrations', 'staging_associations', 'staging_records',
   ]);
   // The columns behind "only when the quote gained a new line" (migration 003).
@@ -238,6 +238,10 @@ test('staging database: migrations create every table once, are safe to repeat, 
   // The single-row tables refuse a second row.
   await assert.rejects(db.query(`INSERT INTO alert_settings (id, enabled, email_recipients, repeat_minutes) VALUES (2, true, '[]'::jsonb, 60)`));
   await assert.rejects(db.query(`INSERT INTO run_lock (id, holder, taken_at) VALUES (2, 'x', now())`));
+  await assert.rejects(db.query(`INSERT INTO admin_password (id, password_hash, variable_hash, changed_at) VALUES (2, 'x', 'y', now())`));
+  // The admin password table (migration 004) starts empty: the ADMIN_PASSWORD variable is the password until it is changed on the page.
+  assert.ok(applied.includes('004_admin_password.sql'));
+  assert.equal((await db.query('SELECT count(*)::int AS n FROM admin_password')).rows[0].n, 0);
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'migrations-'));
   fs.writeFileSync(path.join(dir, '001_ok.sql'), 'CREATE TABLE extra_one (id int);');

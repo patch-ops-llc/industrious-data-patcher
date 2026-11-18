@@ -323,7 +323,7 @@ test('CLI: the service answers the health check and the admin page, runs straigh
     const result = await service.done;
     assert.equal(result.code, 0, result.stdout + result.stderr);
     const lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
-    assert.ok(lines.some((l) => l.msg === 'service starting' && l.intervalMinutes === 30 && l.dryRun === false && l.adminPage === 'on' && l.port === port));
+    assert.ok(lines.some((l) => l.msg === 'service starting' && l.intervalMinutes === 30 && l.dryRun === false && l.adminPage === 'on' && l.adminSignIn === 'ADMIN_PASSWORD variable' && l.port === port));
     assert.ok(lines.some((l) => l.msg === 'run finished' && l.status === 'ok'));
     assert.ok(lines.some((l) => /shutting down/.test(l.msg)));
     assert.ok(!result.stdout.includes(TOKEN), 'the token never appears in the log');
@@ -368,7 +368,7 @@ test('CLI: a failing scheduled run sends the alert through Resend and Slack (loc
     assert.ok(!JSON.stringify(sink.received).includes('not-the-token'));
 
     const lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
-    assert.ok(lines.some((l) => l.msg === 'service starting' && l.adminPage === 'off' && l.alertEmail === true && l.alertSlack === true));
+    assert.ok(lines.some((l) => l.msg === 'service starting' && l.adminPage === 'off' && l.adminSignIn === 'off' && l.alertEmail === true && l.alertSlack === true));
     assert.ok(!result.stdout.includes('re_test_CLI'));
     const state = await sql(`SELECT failing, last_subject, last_result FROM alert_state`);
     assert.equal(state[0].failing, true);

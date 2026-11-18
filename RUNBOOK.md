@@ -35,7 +35,7 @@ On a deploy the old copy is told to stop and is given two minutes to finish its 
 
 ## Where to look
 
-- **Admin page** (the service's public address): status and counts of the last run, alert settings, test alert.
+- **Admin page** (the service's public address): status and counts of the last run, alert settings, test alert, and changing the page's password.
 - **Service log:** JSON lines in Railway under the service. Each run logs `run started`, one `rule processed` line per association with its counts, `deal amounts processed`, and `run finished` with the status.
 - **Last report:** `node src/cli.js report` in a shell on the service (`railway ssh`), or `report <run id>` for an earlier run.
 - **Staging database** (Railway's data view, or any Postgres client):
@@ -139,7 +139,11 @@ A held change that comes off the list is named in that run's report as applied o
 
 **The admin page says it is switched off (503).** `ADMIN_PASSWORD` is not set or is shorter than 12 characters. Set it and redeploy.
 
-**Locked out of the admin page.** Ten wrong passwords within 15 minutes lock sign-in for everyone until the oldest of them is 15 minutes old. Wait, or redeploy to clear it. To change the password, change `ADMIN_PASSWORD` and redeploy; everyone is signed out.
+**Locked out of the admin page.** Ten wrong passwords within 15 minutes lock sign-in for everyone until the oldest of them is 15 minutes old. Wait, or redeploy to clear it.
+
+**Changing the admin password.** Sign in, and use the Password box on the admin page: current password, new password (12 characters or more), and the new one again. Every other session is signed out. From then on the value of `ADMIN_PASSWORD` in Railway no longer signs in; leave the variable set, because the page is switched off without it. The Password box says whether the password in use is the starting one from the variable or one set on the page, and when.
+
+**The admin password is forgotten.** Give `ADMIN_PASSWORD` a new value in Railway (12 characters or more, and different from the value it has now). Railway redeploys the service, the service removes the password that was set on the page, and the new value of the variable is the password. The log line `service starting` then shows `adminSignIn: ADMIN_PASSWORD variable`, with a warning line saying the stored password was removed. Sign in with the new value and, if wanted, change the password on the page again. Saving the variable with the value it already has does nothing. The same reset can be done in the database with `DELETE FROM admin_password;`, after which the variable's current value signs in.
 
 **Running a full pass by hand.** Open a shell on the service (`railway ssh`) so the same variables and database are used, then `node src/cli.js reconcile` for a dry run or add `--apply`. A live manual run and the scheduled run cannot overlap; whichever starts second is skipped. Report files written in the container are lost on the next deploy; `node src/cli.js report` prints the stored report at any time.
 

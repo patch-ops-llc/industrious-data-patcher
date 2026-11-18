@@ -70,7 +70,7 @@ HubSpot stays the authority. Before creating anything the service re-reads the a
 ## Requirements
 
 - Node.js 22.
-- A Postgres database (Railway's Postgres service; tested on Postgres 16).
+- A Postgres database (Railway's Postgres service; tested on Postgres 16, and the migrations also applied cleanly on Railway's Postgres 18).
 - A HubSpot private app token for the Industrious portal, with scopes `crm.objects.custom.read`, `crm.objects.custom.write`, `crm.schemas.custom.read`, `crm.objects.deals.read`, `crm.objects.deals.write`, `crm.objects.companies.read`, `crm.objects.companies.write`. For the standard Contact part of the one-time contact cleanup, also `crm.objects.contacts.read` and `crm.objects.contacts.write`.
 - For email alerts: a Resend API key and a from address on a domain verified in Resend. For Slack alerts: an incoming webhook URL.
 - A password for the admin page.
@@ -103,7 +103,7 @@ Nothing has been deployed and no repository or Railway project exists yet. The f
 
 1. Create the repository and push this folder as its root (`package-lock.json` included; `.gitignore` keeps `node_modules`, `.env`, `reports/` and `data/` out).
 2. In a new Railway project add a **PostgreSQL** database service (New, Database, PostgreSQL). Keep its default name, `Postgres`.
-3. Add a service from the repository. `railway.json` sets what Railway needs: start command `node src/cli.js start`, pre-deploy command `node src/cli.js migrate`, health check on `/healthz`, one replica, restart on failure.
+3. Add a service from the repository and enter its settings on the service in Railway: start command `node src/cli.js start`, pre-deploy command `node src/cli.js migrate`, health check on `/healthz` with a 120-second timeout, restart on failure (10 retries), draining time 120 seconds, one replica. Railway does not read these from the repository: it has deprecated `railway.json` (Config as Code) and ignores it on new services, so the repository has none. The runbook lists the settings under "Railway setup".
 4. Set the service variables:
 
 | Variable | Value |
@@ -248,11 +248,11 @@ A dry run lists the changes it would hold without recording them.
 
 - **Anything in Epicor or Jitterbit.** Item B4 and the Jitterbit mapping changes for the two Item B2 fields are being handled outside this service.
 - **Workflow changes.** Turning off the existing HubSpot association workflows is a manual step after validation.
-- **The repository and the Railway project.** Neither exists yet. `railway.json`, `migrations/`, `.gitignore` and `.env.example` are ready.
+- **The repository and the Railway project.** Neither exists yet. `migrations/`, `.gitignore` and `.env.example` are ready.
 - **Mapping editing in the admin page.** A later phase in the spec.
 
 ## Tested and not tested
 
 Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, and the admin page's sign-in and form protections. A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page was checked in Chrome. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
 
-Not tested: any write to the real portal; a live `reconcile` against the real portal; the amounts HubSpot's rollup really shows after lines are linked (the projection assumes the quote amount is the sum of its line amounts, which held for every quote with lines when the portal was read); a Railway deployment and Railway's Postgres; delivery through the real Resend API or a real Slack webhook; `docker-compose.yml`.
+Not tested: any write to the real portal; a live `reconcile` against the real portal; the amounts HubSpot's rollup really shows after lines are linked (the projection assumes the quote amount is the sum of its line amounts, which held for every quote with lines when the portal was read); the service running on Railway (only the build and the migrations have run there, the migrations against Railway's Postgres 18); delivery through the real Resend API or a real Slack webhook; `docker-compose.yml`.

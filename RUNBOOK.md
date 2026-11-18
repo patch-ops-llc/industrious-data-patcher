@@ -16,12 +16,18 @@ The service works only in HubSpot. It does not connect to Epicor or Jitterbit. I
 | Setting | Value |
 | --- | --- |
 | Services | The middleware (from the repository) and a PostgreSQL database |
-| Start command | `node src/cli.js start` (in `railway.json`) |
-| Pre-deploy command | `node src/cli.js migrate` (in `railway.json`); creates or updates the tables before each deploy |
-| Health check | `/healthz` (in `railway.json`) |
+| Start command | `node src/cli.js start` |
+| Pre-deploy command | `node src/cli.js migrate`; creates or updates the tables before each deploy |
+| Health check path | `/healthz` |
+| Health check timeout | 120 seconds |
+| Restart policy | On failure, at most 10 retries |
+| Draining time | 120 seconds |
+| Overlap time | 0 seconds |
 | Replicas | 1 |
 | Variables | `DATABASE_URL=${{Postgres.DATABASE_URL}}`, `HUBSPOT_PRIVATE_APP_TOKEN`, `ADMIN_PASSWORD`, `DRY_RUN`, and the alert settings. See `.env.example` |
 | Public domain | Needed for the admin page |
+
+The start command, pre-deploy command, health check, restart policy, draining time and overlap time are settings on the middleware service in Railway, not files in the repository. Railway has deprecated `railway.json` (Config as Code) and ignores it on new services, so the repository has none. If the service is ever recreated, enter these values by hand in the service's settings before the first deploy; without them a deploy runs with no pre-deploy step and no health check.
 
 `DRY_RUN` controls whether the scheduled runs write. Leave it unset or `true` to watch what the service would do; set it to `false` to go live.
 

@@ -4,7 +4,7 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { sendTestAlert } from '../alerts.js';
 import { MAX_EMAIL_RECIPIENTS, parseEmailList } from '../config.js';
-import { clearAdminPassword, getAdminPassword, getAlertSettings, getAlertState, lastRun, saveAdminPassword, saveAlertSettings, saveScheduleSettings } from '../db/store.js';
+import { clearAdminPassword, getAdminPassword, getAlertSettings, getAlertState, lastLinkHealth, lastRun, saveAdminPassword, saveAlertSettings, saveScheduleSettings } from '../db/store.js';
 import { effectiveSchedule, intervalChoices, intervalLabel } from '../schedule.js';
 import { hashPassword, verifyPassword } from './password.js';
 import { dashboardPage, loginPage, messagePage } from './views.js';
@@ -244,10 +244,11 @@ export function createAdminServer({ db, settings, alerter, logger, runs = null, 
   }
 
   async function renderDashboard(res, session, { status = 200, notice = null, error = null, form = null, watching = false } = {}) {
-    const [alertSettings, alertState, run, stored] = [
+    const [alertSettings, alertState, run, health, stored] = [
       await getAlertSettings(db),
       await getAlertState(db),
       await lastRun(db, { modes: ['incremental', 'full'] }),
+      await lastLinkHealth(db),
       await storedPassword(),
     ];
     const sync = await syncView(watching);
@@ -258,6 +259,7 @@ export function createAdminServer({ db, settings, alerter, logger, runs = null, 
     send(res, status, dashboardPage({
       csrf: session.csrf,
       run,
+      health,
       alertSettings,
       alertState,
       channels: alerter.status(alertSettings.emailRecipients),

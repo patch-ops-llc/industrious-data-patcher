@@ -182,6 +182,7 @@ Editing mappings in a web page is a later phase in the spec and is not built.
 
 `start` serves a small page on the service's public address:
 
+- see link health: how many records of each type are linked to the record their ID matches,
 - see the status and counts of the last run,
 - start a run now ("Sync now"),
 - pause the schedule or change how often it runs,
@@ -190,6 +191,23 @@ Editing mappings in a web page is a later phase in the spec and is not built.
 - change the page's own password.
 
 These settings are stored in the staging database, so they survive restarts and deploys.
+
+**Link health.** The first box on the page answers "how much is linked", not only "what is missing". One line per kind of record:
+
+| Line | Linked means | Matched on |
+| --- | --- | --- |
+| Epicor Quote Line Item to Epicor Quote | the line is associated with the quote that has its quote number | `quote_number` |
+| Epicor Task to Epicor Quote | the task is associated with the quote that has its quote number | `quote_id` |
+| Epicor Quote to Deal | the quote is associated with the deal its deal ID names, or with the deal that carries its quote number | `hubspot_deal_id` or `quote_number` |
+| Epicor Quote to Company | the quote is associated with the company that has its customer ID | `customer_uid` |
+| Customer IC Code to Company | the IC code is associated with the company that has its customer ID | `customer_uid` |
+
+Each line shows the number of records, how many of them carry an ID, how many are linked, and that share as a percentage and a bar. What is not linked is listed next to it with the reason: would be linked by a live run (after a dry run), failed, held for review, the ID matches no record, or the record has no ID. Linked, pending, failed, held and no match add up to the records with an ID.
+
+- The percentage is the share of records with an ID. A record without one (a task with quote ID 0, for example) cannot be matched and is counted separately, not against the percentage. It is rounded down, so 100% means every one.
+- "Linked" means linked by ID. A quote someone associated by hand with a deal that neither its deal ID nor its quote number leads to is counted under "match no Deal", and its association is left alone.
+- The two ways of finding a quote's deal are one line: a quote counts as linked when either found it linked, and once.
+- The figures are those of the last finished run, which the box names. Every run works them out from what it already reads, for every record and not only the changed ones, with no extra call to HubSpot. They are stored with the run (`runs.summary`, key `health`) and logged as `link health` lines. A run in progress or a failed run leaves the previous figures in place. After a deploy the box fills in when the first run has finished.
 
 **Sync now.** The button starts the run the schedule would make next: the incremental `run`, in the mode the service is in. While `DRY_RUN` is not `false` that is a dry run, which reads from HubSpot and changes nothing; after go-live it writes, exactly as a scheduled run does. The page cannot choose the mode, a limit or a full reconciliation, and anything extra sent with the form is ignored. One run at a time: while a run is in progress the button is replaced by "Follow this run", and a request to start another is refused. After pressing it the page reloads every 5 seconds until the run has finished and then shows the result under Last run. The run counts as a run of the service: alerts follow its result, and the next scheduled run comes one interval after it started.
 
@@ -276,6 +294,6 @@ A dry run lists the changes it would hold without recording them.
 
 ## Tested and not tested
 
-Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, the admin page's sign-in and form protections, changing and recovering the admin password, and "Sync now" and the schedule (through the real service in dry run, and the scheduler with pausing, interval changes and runs by hand). A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page, including the password change, "Sync now" and the schedule, was checked in Chrome at desktop and phone widths against a local dry run with the stand-in HubSpot. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
+Tested: the automated suite (`npm test`) against an in-memory stand-in for the HubSpot API, on the embedded Postgres and on a Postgres 16 server through the `pg` driver. It covers the shipped mapping against a stand-in laid out like the Industrious portal, the command line end to end in its own process (including the service, the health check, the admin page and alerts through local stand-ins for Resend and Slack), migrations, the admin page's sign-in and form protections, changing and recovering the admin password, link health (per kind of record, in dry and live runs, with the two deal rules counted once), and "Sync now" and the schedule (through the real service in dry run, and the scheduler with pausing, interval changes and runs by hand). A copy of the portal's records and associations (read on 2026-11-12) was loaded into the stand-in and the service run against that copy. The admin page, including link health, the password change, "Sync now" and the schedule, was checked in Chrome at desktop and phone widths against a local dry run with the stand-in HubSpot. Read-only against the real portal: `preflight` passes, and a full `reconcile` dry run was made on 2026-11-13.
 
 Not tested: any write to the real portal; a live `reconcile` against the real portal; the amounts HubSpot's rollup really shows after lines are linked (the projection assumes the quote amount is the sum of its line amounts, which held for every quote with lines when the portal was read); a live run on Railway (the build and the migrations have run there, the migrations against Railway's Postgres 18); delivery through the real Resend API or a real Slack webhook; `docker-compose.yml`.

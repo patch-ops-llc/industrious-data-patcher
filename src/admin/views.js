@@ -99,6 +99,71 @@ const plural = (n, one, many) => `${count(n)} ${n === 1 ? one : many}`;
 
 const RELOAD_SECONDS = 5;
 
+/** Share linked, to one decimal and rounded down, so 100% is only shown when nothing is missing. */
+function share(linked, of) {
+  if (!of) return null;
+  if (linked >= of) return '100%';
+  if (linked <= 0) return '0%';
+  return `${(Math.floor((linked / of) * 1000) / 10).toFixed(1)}%`;
+}
+
+function healthRow(group, dryRun) {
+  const n = (value) => Math.max(0, Number(value) || 0);
+  const [records, withKey, linked] = [n(group.records), n(group.withKey), n(group.linked)];
+  const percent = share(linked, withKey);
+  const complete = withKey > 0 && linked >= withKey;
+  const width = withKey ? Math.min(100, (linked / withKey) * 100).toFixed(2) : '0';
+  const to = esc(group.toLabel);
+  const rest = [
+    [n(group.pending), 'warn', dryRun ? 'would be linked by a live run' : 'not linked yet'],
+    [n(group.failed), 'bad', 'failed'],
+    [n(group.held), 'warn', 'held for review'],
+    [n(group.noMatch), 'warn', `${n(group.noMatch) === 1 ? 'matches' : 'match'} no ${to}`],
+    [n(group.noKey), 'quiet', n(group.noKey) === 1 ? 'has no ID' : 'have no ID'],
+  ].filter(([value]) => value > 0).map(([value, tone, text]) => `<li class="chip ${tone}"><strong>${count(value)}</strong> ${text}</li>`);
+  if (complete) rest.unshift(`<li class="chip good">${n(group.noKey) ? 'Every record with an ID is linked' : 'Every record is linked'}</li>`);
+  if (!records) rest.push('<li class="chip quiet">No records yet</li>');
+  const chips = rest.join('\n');
+  const keys = (group.keys || []).map((key) => `<code>${esc(key)}</code>`).join(' or ');
+  return `<li class="health-row">
+<div class="health-what">
+<p class="health-name">${esc(group.fromLabel)} <span class="health-to">to</span> ${to}</p>
+<p class="hint">${plural(records, 'record', 'records')}${n(group.noKey) ? `, ${count(withKey)} with an ID` : ''}${keys ? `. Matched on ${keys}.` : '.'}</p>
+</div>
+<div class="health-figure">
+<p class="health-share${complete ? ' good' : ''}">${percent ?? '&ndash;'}</p>
+<p class="health-count"><strong>${count(linked)}</strong> of ${count(withKey)} linked</p>
+</div>
+<svg class="health-bar" role="img" aria-label="${percent ? `${percent} linked` : 'Nothing to link'}" width="100%" height="8" focusable="false"><rect class="track" width="100%" height="8"></rect><rect class="fill${complete ? ' good' : ''}" width="${width}%" height="8"></rect></svg>
+<ul class="chips">
+${chips}
+</ul>
+</li>`;
+}
+
+/** How many records of each type are linked to the record their ID matches, as the last finished run found it. */
+function healthCard(health) {
+  const groups = Array.isArray(health?.groups) ? health.groups : [];
+  if (!groups.length) {
+    return `<section class="card">
+<h2>Link health</h2>
+<p class="muted">How many records of each type are linked to the record their ID matches. Every run works this out; the figures appear here when the next run has finished.</p>
+</section>`;
+  }
+  const kind = health.mode === 'full' ? 'reconciliation' : 'sync';
+  const caveat = health.dryRun
+    ? ' That was a dry run, so nothing was linked by it.'
+    : health.limit ? ` That run was limited to ${esc(health.limit)} records per association.` : '';
+  return `<section class="card">
+<h2>Link health</h2>
+<p class="muted">How many records of each type are linked in HubSpot to the record their ID matches. As of the ${kind} finished <span class="nowrap">${esc(when(health.finishedAt))}</span>.${caveat}</p>
+<ul class="health">
+${groups.map((group) => healthRow(group, health.dryRun)).join('\n')}
+</ul>
+<p class="hint">The percentage is the share of records that carry an ID. Records without an ID cannot be matched and are listed separately.</p>
+</section>`;
+}
+
 /** Sync now, and when the next scheduled run is. Empty when the page has no run control. */
 function syncBlock(sync, hidden) {
   if (!sync) return '';
@@ -273,7 +338,7 @@ ${options}
 </section>`;
 }
 
-export function dashboardPage({ csrf, run, alertSettings, alertState, channels, fromAddress, service, password, sync = null, form = null, notice = null, error = null, maxRecipients }) {
+export function dashboardPage({ csrf, run, health = null, alertSettings, alertState, channels, fromAddress, service, password, sync = null, form = null, notice = null, error = null, maxRecipients }) {
   const values = form || {
     enabled: alertSettings.enabled,
     recipients: alertSettings.emailRecipients.join('\n'),
@@ -295,7 +360,7 @@ ${LOGO}
 <div>
 <p class="eyebrow">Epicor and HubSpot</p>
 <h1>Association cleanup</h1>
-<p class="hero-sub">${sync ? 'Run status, schedule and alerts' : 'Alert settings and run status'}</p>
+<p class="hero-sub">${sync ? 'Link health, runs, schedule and alerts' : 'Link health, run status and alerts'}</p>
 </div>
 <p class="mode ${mode[0]}"><strong>${mode[1]}</strong><span>${mode[2]}</span></p>
 </div>
@@ -303,6 +368,8 @@ ${LOGO}
 <main class="wrap">
 ${notice ? `<p class="notice good" role="status">${esc(notice)}</p>` : ''}
 ${error ? `<p class="notice bad" role="alert">${esc(error)}</p>` : ''}
+${refresh ? `<p class="notice info" role="status">A run is in progress. This page reloads every ${RELOAD_SECONDS} seconds until it finishes.</p>` : ''}
+${healthCard(health)}
 ${lastRunCard(run, sync, hidden)}
 <div class="columns">
 <div class="column">

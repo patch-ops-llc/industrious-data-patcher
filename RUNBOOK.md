@@ -38,14 +38,20 @@ On a deploy the old copy is told to stop and is given two minutes to finish its 
 
 ## Where to look
 
-- **Admin page** (the service's public address): status and counts of the last run, "Sync now", the schedule, alert settings, test alert, and changing the page's password.
-- **Service log:** JSON lines in Railway under the service. Each run logs `run started`, one `rule processed` line per association with its counts, `deal amounts processed`, and `run finished` with the status.
+- **Admin page** (the service's public address): link health (how many records of each type are linked to the record their ID matches, with the share as a percentage), status and counts of the last run, "Sync now", the schedule, alert settings, test alert, and changing the page's password.
+- **Service log:** JSON lines in Railway under the service. Each run logs `run started`, one `rule processed` line per association with its counts, one `link health` line per kind of record (`records`, `withKey`, `linked`, `pending`, `failed`, `held`, `noMatch`, `noKey`), `deal amounts processed`, and `run finished` with the status.
 - **Last report:** `node src/cli.js report` in a shell on the service (`railway ssh`), or `report <run id>` for an earlier run.
 - **Staging database** (Railway's data view, or any Postgres client):
 
 ```sql
 -- the last 20 runs
 SELECT started_at, mode, dry_run, status, error FROM runs ORDER BY started_at DESC LIMIT 20;
+
+-- link health as the last finished run found it (the same figures as on the admin page)
+SELECT h->>'fromLabel' AS records_of, h->>'toLabel' AS linked_to, h->>'records' AS records, h->>'withKey' AS with_id,
+       h->>'linked' AS linked, h->>'noMatch' AS no_match, h->>'held' AS held, h->>'noKey' AS no_id
+FROM (SELECT summary FROM runs WHERE finished_at IS NOT NULL AND jsonb_typeof(summary->'health') = 'array' ORDER BY started_at DESC LIMIT 1) r,
+     jsonb_array_elements(r.summary->'health') h;
 
 -- what is waiting for a person, by association and reason
 SELECT rule_id, status, count(*) FROM review_items WHERE resolved_at IS NULL GROUP BY 1, 2 ORDER BY 1, 2;

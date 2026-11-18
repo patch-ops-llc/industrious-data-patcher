@@ -262,6 +262,40 @@ button.quiet:hover { border-color: var(--ink); background: var(--ink); color: #f
 .notice { margin: 0 0 20px; padding: 13px 16px; border: 1px solid; border-left-width: 5px; background: var(--paper); font-weight: 500; }
 .notice.good { border-color: var(--good); color: #17602a; }
 .notice.bad { border-color: var(--bad); color: #98192a; }
+.notice.info { border-color: var(--info); color: var(--charcoal); }
+
+/* Link health: one row per kind of record, with the share that is linked. */
+.health { margin: 18px 0 0; padding: 0; border-top: 2px solid var(--ink); list-style: none; }
+.health-row {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 4fr) minmax(200px, auto);
+  grid-template-areas: "what bar figure" "chips chips chips";
+  gap: 10px 32px;
+  align-items: center;
+  padding: 16px 0 17px;
+  border-bottom: 1px solid var(--line);
+}
+.health-row p { margin: 0; }
+.health-what { grid-area: what; min-width: 0; }
+.health-name { color: var(--ink); font-size: 15px; font-weight: 700; }
+.health-to { color: var(--muted); font-size: 13px; font-weight: 500; }
+.health-what .hint { margin-top: 2px; }
+.health-what code { font-size: 12px; overflow-wrap: anywhere; }
+.health-figure { grid-area: figure; text-align: right; }
+.health-share { color: var(--ink); font-size: 26px; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.health-share.good { color: var(--good); }
+.health-count { margin-top: 3px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.health-bar { grid-area: bar; display: block; width: 100%; height: 8px; }
+.health-bar .track { fill: #e3e6ea; }
+.health-bar .fill { fill: var(--good); }
+.chips { grid-area: chips; display: flex; flex-wrap: wrap; gap: 6px 8px; margin: 0; padding: 0; list-style: none; }
+.chip { padding: 3px 10px; border: 1px solid var(--line); background: #f8f8f9; color: var(--charcoal); font-size: 12.5px; }
+.chip strong { color: inherit; font-variant-numeric: tabular-nums; }
+.chip.good { border-color: #b7dbc0; background: #f1f9f3; color: #17602a; }
+.chip.warn { border-color: #e8c99c; background: #fff7ea; color: #7a4300; }
+.chip.bad { border-color: #e9b3ba; background: #fdf1f2; color: #98192a; }
+.chip.quiet { color: var(--muted); }
+.health + .hint { margin-top: 14px; }
 
 .channels { margin: 14px 0 18px; padding: 12px 14px; border: 1px solid var(--line); background: #f8f8f9; list-style: none; }
 .channels li { display: flex; gap: 10px; align-items: baseline; margin: 4px 0; }
@@ -297,6 +331,7 @@ body.dark { background: var(--ink) url("/assets/gear.svg") no-repeat right -190p
   dl.wide { grid-template-columns: 110px minmax(0, 1fr); }
   dl.wide .error-text { grid-column: auto; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .health-row { grid-template-columns: minmax(0, 1fr) minmax(180px, auto); grid-template-areas: "what figure" "bar bar" "chips chips"; }
 }
 
 @media (max-width: 640px) {
@@ -315,6 +350,9 @@ body.dark { background: var(--ink) url("/assets/gear.svg") no-repeat right -190p
   select { max-width: none; }
   .stat { padding: 14px 14px 13px; }
   .stat-value { font-size: 26px; }
+  .health-row { grid-template-columns: minmax(0, 1fr); grid-template-areas: "what" "figure" "bar" "chips"; gap: 9px; }
+  .health-figure { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; text-align: left; }
+  .health-share { font-size: 24px; }
   dl, dl.wide { grid-template-columns: minmax(0, 1fr); gap: 0; }
   dl.wide .error-text { grid-column: auto; }
   dd { margin-bottom: 10px; }

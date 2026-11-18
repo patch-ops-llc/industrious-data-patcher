@@ -1,4 +1,5 @@
 import { insertActions, markMissingByIds, replaceAssociations, saveReviewItems } from '../db/store.js';
+import { outcomeRecorder } from './health.js';
 import { describeRawKey, matchRule } from './match.js';
 
 const MAX_UNRESOLVED_ROWS = 100_000;
@@ -61,7 +62,8 @@ function setFor(map, key) {
  * 3. Only what is missing is created. Nothing existing is changed or removed.
  * 4. On a live run the result is read back from HubSpot to confirm it.
  *
- * run: { runId, startedAt, refresh, changed, arrived, limit, persist, planned, refreshed }
+ * run: { runId, startedAt, refresh, changed, arrived, limit, persist, planned, refreshed, outcomes }
+ * run.outcomes, when given, collects what was found for every record (health.js).
  * Returns { links, touchedTargets, newLinkTargets, arrivedTargets }. arrivedTargets
  * are the targets matched by a source record that arrived since the previous
  * run (run.arrived), whether or not HubSpot had already associated the two.
@@ -83,6 +85,7 @@ export async function processRule(ctx, rule, run, stats) {
   const newLinkTargets = new Set();
   const arrivedTargets = new Set();
   const multiKeys = new Set();
+  const found = outcomeRecorder(run.outcomes, rule);
   // With ifNoMatch "ignore_if_associated" (a second way of finding the same
   // parent, such as the quote number on deals) a record without a match is
   // only reported when it has no parent of that type at all.
@@ -97,8 +100,10 @@ export async function processRule(ctx, rule, run, stats) {
     const key = describeRawKey(fromProps, row.raw);
     if (row.missingKey) {
       stats.missingKey += 1;
+      found(row.id, 'noKey');
       noteUnresolved(stats, row.id, 'missing_key', key);
     } else if (row.targetIds.length === 0) {
+      found(row.id, 'noMatch');
       if (quiet) {
         undecided.push({ row, key, status: 'no_target' });
       } else {
@@ -107,6 +112,7 @@ export async function processRule(ctx, rule, run, stats) {
       }
     } else if (row.targetIds.length > 1 && rule.onMultipleTargets === 'skip') {
       stats.multipleTargets += 1;
+      found(row.id, 'held');
       multiKeys.add((row.raw || []).map((v) => String(v ?? '').trim().toLowerCase()).join('\u0000'));
       if (quiet) undecided.push({ row, key, status: 'multiple_targets' });
       else noteUnresolved(stats, row.id, 'multiple_targets', key, `matches ${toLabel} ${row.targetIds.join(', ')}`);
@@ -123,8 +129,15 @@ export async function processRule(ctx, rule, run, stats) {
     const known = new Set(row.knownIds);
     return row.targetIds.some((id) => !known.has(id));
   };
-  const live = expected.filter(needsLiveRead);
-  stats.alreadyAssociated += expected.length - live.length;
+  const live = [];
+  for (const row of expected) {
+    if (needsLiveRead(row)) {
+      live.push(row);
+    } else {
+      stats.alreadyAssociated += 1;
+      found(row.id, 'linked');
+    }
+  }
 
   const recheck = undecided.map((entry) => entry.row).filter((row) => run.refresh || changedSources.has(row.id));
   const toRead = [...live, ...recheck].map((row) => row.id).filter((id) => !refreshed.has(id));
@@ -135,8 +148,9 @@ export async function processRule(ctx, rule, run, stats) {
     stats.associationsRead += toRead.length;
   }
 
+  const inHubSpot = (row) => new Set(fresh.has(row.id) ? fresh.get(row.id).map((a) => a.id) : row.knownIds);
   const current = (row) => {
-    const have = new Set(fresh.has(row.id) ? fresh.get(row.id).map((a) => a.id) : row.knownIds);
+    const have = inHubSpot(row);
     // Associations an earlier rule of this dry run would have created count as existing.
     for (const id of planned.get(row.id) || []) have.add(id);
     return have;
@@ -164,13 +178,18 @@ export async function processRule(ctx, rule, run, stats) {
     const hasOther = have.size > 0 && missing.length === row.targetIds.length;
     if (missing.length === 0) {
       stats.alreadyAssociated += 1;
+      // In a dry run an association that an earlier rule only planned is not in HubSpot yet.
+      const real = planned.has(row.id) ? inHubSpot(row) : have;
+      found(row.id, row.targetIds.every((id) => real.has(id)) ? 'linked' : 'pending');
     } else if (hasOther && rule.ifAssociatedElsewhere === 'skip') {
       // Associated to some other record of this type, but not the one its key points to.
       stats.associatedElsewhere += 1;
+      found(row.id, 'held');
       noteUnresolved(stats, row.id, 'associated_elsewhere', describeRawKey(fromProps, row.raw),
         `has ${toLabel} ${[...have].join(', ')}; key matches ${row.targetIds.join(', ')}`);
     } else if (run.limit && withGaps.length >= run.limit) {
       stats.notAttempted += 1;
+      found(row.id, 'pending');
     } else {
       if (hasOther) stats.addedAlongsideOther += 1;
       withGaps.push({ row, missing });
@@ -185,6 +204,7 @@ export async function processRule(ctx, rule, run, stats) {
       if (!run.planned.has(pair)) run.planned.set(pair, planned);
       for (const { row, missing } of withGaps) {
         stats.planned += 1;
+        found(row.id, 'pending');
         stats.associationsPlanned += missing.length;
         for (const toId of missing) {
           links.push({ fromId: row.id, toId, planned: true });
@@ -192,7 +212,7 @@ export async function processRule(ctx, rule, run, stats) {
         }
       }
     } else {
-      await confirmCreated(ctx, rule, run, stats, { withGaps, troubled, links, newLinkTargets });
+      await confirmCreated(ctx, rule, run, stats, { withGaps, troubled, links, newLinkTargets, found });
     }
   }
 
@@ -208,7 +228,7 @@ export async function processRule(ctx, rule, run, stats) {
 }
 
 /** Reads back what HubSpot now holds rather than trusting the batch response. */
-async function confirmCreated(ctx, rule, run, stats, { withGaps, troubled, links, newLinkTargets }) {
+async function confirmCreated(ctx, rule, run, stats, { withGaps, troubled, links, newLinkTargets, found }) {
   const { api, db, mapping } = ctx;
   const fromObj = mapping.objects[rule.from];
   const toObj = mapping.objects[rule.to];
@@ -240,9 +260,13 @@ async function confirmCreated(ctx, rule, run, stats, { withGaps, troubled, links
         unverified += 1;
       }
     }
-    if (entry.failedTargets.length) failedEntries.push(entry);
-    else if (unverified > 0) stats.createdUnverified += 1;
+    if (entry.failedTargets.length) {
+      failedEntries.push(entry);
+      continue;
+    }
+    if (unverified > 0) stats.createdUnverified += 1;
     else stats.created += 1;
+    found(entry.row.id, 'linked');
   }
   if (failedEntries.length === 0) return;
 
@@ -260,11 +284,14 @@ async function confirmCreated(ctx, rule, run, stats, { withGaps, troubled, links
     const key = describeRawKey(fromProps, entry.row.raw);
     if (!presentSources.has(entry.row.id)) {
       stats.gone += 1;
+      found(entry.row.id, 'gone');
     } else if (entry.failedTargets.every((id) => !presentTargets.has(id))) {
       stats.noTarget += 1;
+      found(entry.row.id, 'noMatch');
       noteUnresolved(stats, entry.row.id, 'no_target', key, `the matching ${toLabel} no longer exists in HubSpot`);
     } else {
       stats.failed += 1;
+      found(entry.row.id, 'failed');
       stats.associationsFailed += entry.failedTargets.filter((id) => presentTargets.has(id)).length;
       noteUnresolved(stats, entry.row.id, 'failed', key, entry.error);
     }

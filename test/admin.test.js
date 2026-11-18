@@ -7,7 +7,7 @@ import { hashPassword, verifyPassword } from '../src/admin/password.js';
 import { createAdminServer } from '../src/admin/server.js';
 import { createAlerter } from '../src/alerts.js';
 import { loadSettings } from '../src/config.js';
-import { getAdminPassword, getAlertSettings, getAlertState, getScheduleSettings, saveAlertSettings, saveScheduleSettings } from '../src/db/store.js';
+import { finishRun, getAdminPassword, getAlertSettings, getAlertState, getScheduleSettings, insertRun, saveAlertSettings, saveScheduleSettings } from '../src/db/store.js';
 import { executeRun } from '../src/engine/run.js';
 import { effectiveSchedule } from '../src/schedule.js';
 import { startScheduler } from '../src/scheduler.js';
@@ -180,7 +180,7 @@ test('admin: signing in needs the password; the session cookie is HttpOnly, Secu
 
   const page = await a.request('GET', '/', { cookie: ok.cookie });
   assert.equal(page.status, 200);
-  assert.match(page.text, /Alert settings/);
+  assert.match(page.text, /Link health, run status and alerts/);
   assert.match(page.text, /No run has been recorded yet/);
   assert.equal(page.headers.get('strict-transport-security'), 'max-age=31536000');
 
@@ -438,6 +438,112 @@ test('admin: the page shows the last run status and never contains a secret, eve
   // Password boxes are never filled in by the server.
   assert.doesNotMatch(everything, /<input[^>]*type="password"[^>]*value=/);
   assert.ok(orphan);
+  await a.close();
+  await h.cleanup();
+});
+
+test('admin: link health shows, for each kind of record, how many are linked to the record their ID matches, as of the last finished run', async () => {
+  const h = await makeHarness();
+  const { fake } = h;
+  addQuoteFamily(fake, { quote: 'Q1', customer: 'C1', contactNumber: '1' });
+  fake.addRecord(T.line, { epicor_quote_num: 'NONE' });
+  fake.addRecord(T.line, { epicor_quote_num: '' });
+  fake.advance(10);
+  const a = await startAdmin(h);
+  const { cookie } = await a.login();
+  const card = (text) => text.slice(text.indexOf('<h2>Link health</h2>'), text.indexOf('<h2>Last run</h2>'));
+  const row = (text, name) => card(text).split('<li class="health-row">').find((part) => part.includes(`<p class="health-name">${name}</p>`));
+  const lines = 'Quote line <span class="health-to">to</span> Quote header';
+  const tasks = 'Quote task <span class="health-to">to</span> Quote header';
+
+  // Before any run there is nothing to show yet, and the page says where the figures will come from.
+  let page = await a.request('GET', '/', { cookie });
+  assert.ok(page.text.indexOf('<h2>Link health</h2>') < page.text.indexOf('<h2>Last run</h2>'), 'link health comes first');
+  assert.match(card(page.text), /Every run works this out; the figures appear here when the next run has finished\./);
+  assert.doesNotMatch(card(page.text), /health-row/);
+
+  // A dry run: what is linked now, and what a live run would link.
+  await executeRun(h.ctx({ dryRun: true }), { mode: 'incremental' });
+  page = await a.request('GET', '/', { cookie });
+  assert.match(card(page.text), /As of the sync finished <span class="nowrap">2026-11-01 00:10 UTC<\/span>\. That was a dry run, so nothing was linked by it\./);
+  assert.match(row(page.text, lines), /<p class="hint">4 records, 3 with an ID\. Matched on <code>epicor_quote_num<\/code>\.<\/p>/);
+  assert.match(row(page.text, lines), /<p class="health-share">0%<\/p>\n<p class="health-count"><strong>0<\/strong> of 3 linked<\/p>/);
+  assert.match(row(page.text, lines), /<rect class="fill" width="0\.00%" height="8"><\/rect>/);
+  assert.deepEqual([...row(page.text, lines).matchAll(/<li class="chip (\w+)">(.*?)<\/li>/g)].map((m) => [m[1], m[2]]), [
+    ['warn', '<strong>2</strong> would be linked by a live run'],
+    ['warn', '<strong>1</strong> matches no Quote header'],
+    ['quiet', '<strong>1</strong> has no ID'],
+  ]);
+  assert.match(row(page.text, 'IC code <span class="health-to">to</span> Company'), /<p class="health-share">&ndash;<\/p>[\s\S]*No records yet/);
+
+  // A live run: the same records, now linked.
+  fake.advance(30);
+  const live = await executeRun(h.ctx(), { mode: 'full' });
+  page = await a.request('GET', '/', { cookie });
+  assert.match(card(page.text), /As of the reconciliation finished <span class="nowrap">2026-11-01 00:40 UTC<\/span>\.<\/p>/);
+  assert.doesNotMatch(card(page.text), /dry run|would be linked/);
+  assert.match(row(page.text, lines), /<p class="health-share">66\.6%<\/p>\n<p class="health-count"><strong>2<\/strong> of 3 linked<\/p>/);
+  assert.match(row(page.text, lines), /<svg class="health-bar" role="img" aria-label="66\.6% linked" width="100%" height="8" focusable="false"><rect class="track" width="100%" height="8"><\/rect><rect class="fill" width="66\.67%" height="8"><\/rect><\/svg>/);
+  assert.deepEqual([...row(page.text, lines).matchAll(/<li class="chip (\w+)">(.*?)<\/li>/g)].map((m) => [m[1], m[2]]), [
+    ['warn', '<strong>1</strong> matches no Quote header'],
+    ['quiet', '<strong>1</strong> has no ID'],
+  ]);
+  assert.match(row(page.text, tasks), /<p class="health-share good">100%<\/p>\n<p class="health-count"><strong>1<\/strong> of 1 linked<\/p>/);
+  assert.match(row(page.text, tasks), /<rect class="fill good" width="100\.00%" height="8"><\/rect>/);
+  assert.deepEqual([...row(page.text, tasks).matchAll(/<li class="chip (\w+)">(.*?)<\/li>/g)].map((m) => [m[1], m[2]]), [['good', 'Every record is linked']]);
+  // The figures are the run's own: linked is what it found in place plus what it created.
+  const rule = h.rule(live, 'lines_to_header');
+  assert.equal(rule.alreadyAssociated + rule.created, 2);
+  const liveCard = card(page.text);
+
+  // A run in progress, and a run that failed before it got to the associations, leave the last figures in place.
+  fake.advance(30);
+  fake.failNext({ pathIncludes: '/search', status: 500, times: 50 });
+  assert.equal((await executeRun(h.ctx(), { mode: 'incremental' })).status, 'failed');
+  page = await a.request('GET', '/', { cookie });
+  assert.match(page.text, /<span class="badge bad">Failed<\/span>/);
+  assert.equal(card(page.text), liveCard);
+  fake.advance(30);
+  await insertRun(h.db, { runId: 'still-running', mode: 'incremental', dryRun: false, limit: null, startedAt: new Date(fake.clock).toISOString() });
+  page = await a.request('GET', '/', { cookie });
+  assert.match(page.text, /<span class="badge info">Running<\/span>/);
+  assert.equal(card(page.text), liveCard);
+
+  // Large numbers, a record without an ID next to a full score, a limited run, and text that must be escaped.
+  fake.advance(30);
+  const crafted = {
+    runId: 'crafted',
+    mode: 'incremental',
+    dryRun: false,
+    limit: 25,
+    startedAt: new Date(fake.clock).toISOString(),
+    finishedAt: new Date(fake.clock + 60_000).toISOString(),
+    status: 'ok',
+    stateSaved: true,
+    health: [
+      { from: 'x', to: 'y', fromLabel: 'Line <b>item</b>', toLabel: 'Quote & "co"', rules: ['r'], keys: ['a<i>', 'b + c'], records: 29838, withKey: 29838, linked: 29837, pending: 3, failed: 2, held: 4, noMatch: 76, noKey: 0 },
+      { from: 'p', to: 'q', fromLabel: 'Task', toLabel: 'Quote', rules: ['s'], keys: ['quote_id'], records: 12873, withKey: 11058, linked: 11058, pending: 0, failed: 0, held: 0, noMatch: 0, noKey: 1815 },
+    ],
+  };
+  await insertRun(h.db, crafted);
+  await finishRun(h.db, crafted, { compact: crafted });
+  page = await a.request('GET', '/', { cookie });
+  const text = card(page.text);
+  assert.match(text, /That run was limited to 25 records per association\./);
+  assert.match(text, /<p class="health-name">Line &lt;b&gt;item&lt;\/b&gt; <span class="health-to">to<\/span> Quote &amp; &quot;co&quot;<\/p>/);
+  assert.match(text, /Matched on <code>a&lt;i&gt;<\/code> or <code>b \+ c<\/code>\./);
+  assert.doesNotMatch(text, /<b>|<i>/);
+  // Rounded down: 29,837 of 29,838 is not shown as 100%.
+  assert.match(text, /<p class="health-share">99\.9%<\/p>\n<p class="health-count"><strong>29,837<\/strong> of 29,838 linked<\/p>/);
+  assert.match(text, /<li class="chip warn"><strong>3<\/strong> not linked yet<\/li>\n<li class="chip bad"><strong>2<\/strong> failed<\/li>\n<li class="chip warn"><strong>4<\/strong> held for review<\/li>\n<li class="chip warn"><strong>76<\/strong> match no Quote &amp; &quot;co&quot;<\/li>/);
+  assert.match(text, /<p class="hint">12,873 records, 11,058 with an ID\. Matched on <code>quote_id<\/code>\.<\/p>/);
+  assert.match(text, /<p class="health-share good">100%<\/p>\n<p class="health-count"><strong>11,058<\/strong> of 11,058 linked<\/p>/);
+  assert.match(text, /<li class="chip good">Every record with an ID is linked<\/li>\n<li class="chip quiet"><strong>1,815<\/strong> have no ID<\/li>/);
+
+  // The bars are drawn without inline styles or scripts, which the page's security policy does not allow.
+  const everything = a.bodies.join('\n');
+  assert.doesNotMatch(everything, / style=|<style|<script|onload=|onclick=/i);
+  for (const [name, value] of Object.entries(SECRETS)) assert.ok(!everything.includes(value), name);
   await a.close();
   await h.cleanup();
 });
@@ -819,6 +925,7 @@ test('admin sync: Sync now starts the service\'s own run, one at a time; in a dr
   assert.match(watching.text, /<meta http-equiv="refresh" content="5; url=\/\?watch=run">/);
   assert.match(watching.text, /<strong>A run started here is in progress<\/strong>/);
   assert.match(watching.text, /This page reloads every 5 seconds until the run finishes\./);
+  assert.match(watching.text, /<p class="notice info" role="status">A run is in progress\. This page reloads every 5 seconds until it finishes\.<\/p>/);
   assert.doesNotMatch(watching.text, /action="\/run"|Follow this run/);
   // The ordinary page does not reload, so nothing typed into a form is lost.
   assert.doesNotMatch((await a.request('GET', '/', { cookie })).text, /http-equiv="refresh"/);

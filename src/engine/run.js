@@ -25,6 +25,7 @@ import {
 import { compactSummary, renderRunMarkdown } from '../report.js';
 import { newRuleStats, processRule } from './associate.js';
 import { newDealAmountStats, projectLinkedLineAmounts, syncDealAmounts } from './dealAmount.js';
+import { linkHealth } from './health.js';
 import { ingestAll, objectsToIngest } from './ingest.js';
 
 const MAX_LINK_ROWS = 200_000;
@@ -223,6 +224,7 @@ export async function executeRun(ctx, { mode = 'incremental', limit = null, deal
     status: 'failed',
     ingest: {},
     rules: [],
+    health: null,
     dealAmount: null,
     api: null,
     stateSaved: false,
@@ -238,6 +240,7 @@ export async function executeRun(ctx, { mode = 'incremental', limit = null, deal
     persist: !api.dryRun,
     planned: new Map(),
     refreshed: new Map(),
+    outcomes: new Map(),
     changed: {},
     arrived: {},
   };
@@ -328,6 +331,8 @@ export async function executeRun(ctx, { mode = 'incremental', limit = null, deal
       const { unresolved, links, ...counts } = stats;
       log.info('rule processed', counts);
     }
+    summary.health = linkHealth(mapping, enabledRules(mapping), run.outcomes);
+    for (const { rules, keys, ...counts } of summary.health) log.info('link health', counts);
 
     if (dealCfg.enabled) {
       const stats = newDealAmountStats();

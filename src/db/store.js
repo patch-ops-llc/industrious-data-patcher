@@ -197,6 +197,23 @@ export async function lastRun(db, { modes = null } = {}) {
   return runRow(rows[0]);
 }
 
+/**
+ * Link health as the most recent finished run found it (engine/health.js), or
+ * null before the first such run. A run in progress or one that failed before
+ * the associations were checked has none, so an earlier run's is returned.
+ */
+export async function lastLinkHealth(db) {
+  const { rows } = await db.query(
+    `SELECT id, mode, dry_run, limit_n, finished_at, summary->'health' AS health
+     FROM runs
+     WHERE mode IN ('incremental', 'full') AND finished_at IS NOT NULL AND jsonb_typeof(summary->'health') = 'array'
+     ORDER BY started_at DESC, finished_at DESC LIMIT 1`,
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return { runId: row.id, mode: row.mode, dryRun: row.dry_run, limit: row.limit_n, finishedAt: row.finished_at, groups: row.health };
+}
+
 export async function getRun(db, id) {
   const { rows } = await db.query('SELECT * FROM runs WHERE id = $1', [id]);
   return runRow(rows[0]);

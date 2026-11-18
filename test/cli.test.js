@@ -316,6 +316,13 @@ test('CLI: the service answers the health check and the admin page, runs straigh
       const page = await (await fetch(`${base}/`, { headers: { cookie } })).text();
       assert.match(page, /<span class="badge good">OK<\/span> <span class="badge live">Live<\/span>/);
       assert.match(page, />ops@example\.com<\/textarea>/, 'ALERT_EMAIL_TO seeds the recipients the first time');
+      // Link health, from the run the service just made: every record of the family is linked by its ID.
+      const health = page.slice(page.indexOf('<h2>Link health</h2>'), page.indexOf('<h2>Last run</h2>'));
+      for (const name of ['Epicor Quote Line Item <span class="health-to">to</span> Epicor Quote', 'Epicor Task <span class="health-to">to</span> Epicor Quote', 'Epicor Quote <span class="health-to">to</span> Deal', 'Epicor Quote <span class="health-to">to</span> Company']) {
+        assert.ok(health.includes(`<p class="health-name">${name}</p>`), name);
+      }
+      assert.equal((health.match(/<p class="health-share good">100%<\/p>\n<p class="health-count"><strong>1<\/strong> of 1 linked<\/p>/g) || []).length, 4);
+      assert.match(health, /Matched on <code>hubspot_deal_id<\/code> or <code>quote_number<\/code>\./);
       assert.ok(!page.includes(TOKEN) && !page.includes(password));
     } finally {
       service.child.kill('SIGTERM');
@@ -325,6 +332,9 @@ test('CLI: the service answers the health check and the admin page, runs straigh
     const lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
     assert.ok(lines.some((l) => l.msg === 'service starting' && l.intervalMinutes === 30 && l.schedule === 'on' && l.scheduleFrom === 'RUN_INTERVAL_MINUTES variable' && l.dryRun === false && l.adminPage === 'on' && l.adminSignIn === 'ADMIN_PASSWORD variable' && l.port === port));
     assert.ok(lines.some((l) => l.msg === 'run finished' && l.status === 'ok'));
+    assert.deepEqual(lines.filter((l) => l.msg === 'link health').map((l) => [l.from, l.to, l.records, l.linked]), [
+      ['quoteLine', 'quoteHeader', 1, 1], ['quoteTask', 'quoteHeader', 1, 1], ['quoteHeader', 'deal', 1, 1], ['quoteHeader', 'company', 1, 1], ['icCode', 'company', 0, 0],
+    ]);
     assert.ok(lines.some((l) => /shutting down/.test(l.msg)));
     assert.ok(!result.stdout.includes(TOKEN), 'the token never appears in the log');
     assert.ok(!result.stdout.includes(password));

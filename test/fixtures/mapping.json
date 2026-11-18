@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "objects": {
+    "quoteHeader": {
+      "label": "Quote header",
+      "objectType": "2-1001",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "quoteNumber": "epicor_quote_num",
+        "customerId": "epicor_cust_id",
+        "quoteContactNumber": "epicor_quote_contact_num",
+        "amount": "quote_amount"
+      }
+    },
+    "quoteLine": {
+      "label": "Quote line",
+      "objectType": "2-1002",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": { "quoteNumber": "epicor_quote_num" }
+    },
+    "quoteTask": {
+      "label": "Quote task",
+      "objectType": "2-1003",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": { "quoteNumber": "epicor_quote_num" }
+    },
+    "icCode": {
+      "label": "IC code",
+      "objectType": "2-1004",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": { "customerId": "epicor_cust_id" }
+    },
+    "contact": {
+      "label": "Contact",
+      "objectType": "contacts",
+      "createdProperty": "createdate",
+      "modifiedProperty": "lastmodifieddate",
+      "properties": { "customerContactNumber": "epicor_contact_num", "customerId": "epicor_cust_id" }
+    },
+    "company": {
+      "label": "Company",
+      "objectType": "companies",
+      "createdProperty": "createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": { "customerId": "epicor_cust_id" }
+    },
+    "deal": {
+      "label": "Deal",
+      "objectType": "deals",
+      "createdProperty": "createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": { "quoteNumber": "epicor_quote_num", "amount": "amount", "isClosed": "hs_is_closed" }
+    }
+  },
+  "rules": [
+    {
+      "id": "lines_to_header", "item": "B1", "label": "Lines to header",
+      "from": "quoteLine", "to": "quoteHeader",
+      "match": [{ "from": "quoteNumber", "to": "quoteNumber" }],
+      "association": { "category": "USER_DEFINED", "typeId": 101 }
+    },
+    {
+      "id": "tasks_to_header", "item": "B1", "label": "Tasks to header",
+      "from": "quoteTask", "to": "quoteHeader",
+      "match": [{ "from": "quoteNumber", "to": "quoteNumber" }],
+      "association": { "category": "USER_DEFINED", "typeId": 103 }
+    },
+    {
+      "id": "header_to_deal", "item": "B1", "label": "Header to deal",
+      "from": "quoteHeader", "to": "deal",
+      "match": [{ "from": "quoteNumber", "to": "quoteNumber" }],
+      "association": { "category": "USER_DEFINED", "typeId": 105 }
+    },
+    {
+      "id": "header_to_company", "item": "B1", "label": "Header to company",
+      "from": "quoteHeader", "to": "company",
+      "match": [{ "from": "customerId", "to": "customerId" }],
+      "association": { "category": "USER_DEFINED", "typeId": 107 }
+    },
+    {
+      "id": "ic_codes_to_company", "item": "B1", "label": "IC codes to company",
+      "from": "icCode", "to": "company",
+      "match": [{ "from": "customerId", "to": "customerId" }],
+      "association": "default"
+    },
+    {
+      "id": "contacts_to_header", "item": "B2", "label": "Contacts to quote header",
+      "from": "quoteHeader", "to": "contact",
+      "match": [{ "from": "quoteContactNumber", "to": "customerContactNumber" }],
+      "association": { "category": "USER_DEFINED", "typeId": 111 }
+    }
+  ],
+  "dealAmount": {
+    "item": "B3",
+    "enabled": true,
+    "header": "quoteHeader",
+    "deal": "deal",
+    "trigger": "header_amount_changed",
+    "requireOneToOne": true,
+    "skipClosedDeals": false,
+    "requireNewLines": false,
+    "backfillInFullRun": false,
+    "guard": { "holdPercentChange": false }
+  },
+  "contactCleanup": {
+    "item": "B2",
+    "rule": "contacts_to_header",
+    "requireNamedContactFound": true,
+    "removeOnlyTypeIds": null
+  }
+}

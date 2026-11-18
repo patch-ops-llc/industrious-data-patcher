@@ -1,0 +1,16 @@
+# Local Postgres for development. Not used on Railway.
+#   docker compose up -d
+#   DATABASE_URL=postgres://cleanup:cleanup@127.0.0.1:5432/cleanup
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: cleanup
+      POSTGRES_PASSWORD: cleanup
+      POSTGRES_DB: cleanup
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - staging-data:/var/lib/postgresql/data
+volumes:
+  staging-data:

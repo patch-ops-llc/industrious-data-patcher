@@ -1,0 +1,232 @@
+{
+  "version": 3,
+  "about": "Object types, property names and association type IDs below were read from HubSpot portal 44686929 on 2026-11-12 (read-only review). The match keys for Item B1 are the ones the portal's existing association workflows use. Run `npm run preflight` to re-check them against the portal. The deal quote_num match and the staging database were added on Zach's decisions of 2026-11-12. Keys named 'notes' are documentation only.",
+  "keyNormalization": {
+    "caseInsensitive": true,
+    "treatAsBlank": ["0", "null"]
+  },
+  "objects": {
+    "quoteHeader": {
+      "label": "Epicor Quote",
+      "objectType": "2-45361208",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "quoteNumber": "quote_number",
+        "customerId": "customer_uid",
+        "customerNumber": "shipping_customer_id",
+        "dealId": "hubspot_deal_id",
+        "amount": "amount",
+        "quoteContactNumber": "REPLACE_ME: internal name of the quote contact number property. It does not exist on Epicor Quote yet; Item B2 adds it to the Jitterbit quote header sync."
+      }
+    },
+    "quoteLine": {
+      "label": "Epicor Quote Line Item",
+      "objectType": "2-45402132",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "quoteNumber": "quote_number",
+        "amount": "amount"
+      }
+    },
+    "quoteTask": {
+      "label": "Epicor Task",
+      "objectType": "2-48899315",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "quoteNumber": "quote_id"
+      }
+    },
+    "icCode": {
+      "label": "Customer IC Code",
+      "objectType": "2-45358916",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "customerId": "customer_uid"
+      }
+    },
+    "contact": {
+      "label": "Epicor Contact",
+      "objectType": "2-55947981",
+      "createdProperty": "hs_createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "customerNumber": "custnum",
+        "customerContactNumber": "REPLACE_ME: internal name of the Epicor customer contact number property. It does not exist on Epicor Contact yet; Item B2 makes it the Jitterbit contact sync key."
+      }
+    },
+    "company": {
+      "label": "Company",
+      "objectType": "companies",
+      "createdProperty": "createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "customerId": "customer_uid",
+        "epicorCustomerId": "epicor_customer_id"
+      }
+    },
+    "deal": {
+      "label": "Deal",
+      "objectType": "deals",
+      "createdProperty": "createdate",
+      "modifiedProperty": "hs_lastmodifieddate",
+      "properties": {
+        "recordId": "hs_object_id",
+        "quoteNumber": "quote_num",
+        "amount": "amount",
+        "isClosed": "hs_is_closed"
+      }
+    },
+    "standardContact": {
+      "label": "Contact",
+      "objectType": "contacts",
+      "createdProperty": "createdate",
+      "modifiedProperty": "lastmodifieddate",
+      "properties": {},
+      "notes": "HubSpot's own Contact object. Only used by the optional standard Contact part of the one-time contact cleanup (contactCleanup.standardContacts); it is not copied into the staging database."
+    }
+  },
+  "rules": [
+    {
+      "id": "lines_to_header",
+      "item": "B1",
+      "label": "Lines to header",
+      "enabled": true,
+      "from": "quoteLine",
+      "to": "quoteHeader",
+      "match": [{ "from": "quoteNumber", "to": "quoteNumber" }],
+      "association": { "category": "USER_DEFINED", "typeId": 98 },
+      "onMultipleTargets": "skip",
+      "ifAssociatedElsewhere": "add",
+      "notes": "Same key as the workflow 'Epicor Quote Line Item > Associate to Epicor Quote' (line quote_number = quote quote_number)."
+    },
+    {
+      "id": "tasks_to_header",
+      "item": "B1",
+      "label": "Tasks to header",
+      "enabled": true,
+      "from": "quoteTask",
+      "to": "quoteHeader",
+      "match": [{ "from": "quoteNumber", "to": "quoteNumber" }],
+      "association": { "category": "USER_DEFINED", "typeId": 123 },
+      "onMultipleTargets": "skip",
+      "ifAssociatedElsewhere": "add",
+      "notes": "Same key as the workflow 'Associate Epicor Task to Epicor Quote' (task quote_id = quote quote_number). Tasks carry quote_id '0' when they have no quote; that value is treated as blank."
+    },
+    {
+      "id": "header_to_deal",
+      "item": "B1",
+      "label": "Header to deal",
+      "enabled": true,
+      "from": "quoteHeader",
+      "to": "deal",
+      "match": [{ "from": "dealId", "to": "recordId" }],
+      "association": { "category": "USER_DEFINED", "typeId": 99 },
+      "onMultipleTargets": "skip",
+      "ifAssociatedElsewhere": "add",
+      "notes": "Same key as the workflow 'Associate Epicor Quote to Deal' (quote hubspot_deal_id = deal record ID)."
+    },
+    {
+      "id": "header_to_deal_by_quote_number",
+      "item": "B1",
+      "label": "Header to deal (quote number typed on the deal)",
+      "enabled": true,
+      "from": "quoteHeader",
+      "to": "deal",
+      "match": [{ "from": "quoteNumber", "to": "quoteNumber" }],
+      "association": { "category": "USER_DEFINED", "typeId": 99 },
+      "onMultipleTargets": "skip",
+      "ifAssociatedElsewhere": "add",
+      "ifNoMatch": "ignore_if_associated",
+      "notes": "Second way to find a quote's deal: quote quote_number = deal quote_num, the quote number typed by hand on the deal. Runs after header_to_deal. onMultipleTargets 'skip': a quote number found on more than one deal is not linked; the quote is held for review and counted in the reconciliation report. ifAssociatedElsewhere 'add': a quote that already has a different deal also gets the deal that carries its quote number; the existing deal association is kept and nothing is removed ('skip' would hold such quotes for review instead). A quote with more than one deal is outside Item B3 while dealAmount.requireOneToOne is true. ifNoMatch 'ignore_if_associated': a quote whose number is on no deal is only reported as unmatched when it has no deal at all, so 'No match found' for this association is the number of quotes without any deal."
+    },
+    {
+      "id": "header_to_company",
+      "item": "B1",
+      "label": "Header to company",
+      "enabled": true,
+      "from": "quoteHeader",
+      "to": "company",
+      "match": [{ "from": "customerId", "to": "customerId" }],
+      "association": { "category": "USER_DEFINED", "typeId": 95 },
+      "onMultipleTargets": "skip",
+      "ifAssociatedElsewhere": "add",
+      "notes": "Same key as the workflow 'Associate Epicor Quote to Company' (quote customer_uid = company customer_uid)."
+    },
+    {
+      "id": "ic_codes_to_company",
+      "item": "B1",
+      "label": "IC codes to company",
+      "enabled": true,
+      "from": "icCode",
+      "to": "company",
+      "match": [{ "from": "customerId", "to": "epicorCustomerId" }],
+      "association": { "category": "USER_DEFINED", "typeId": 93 },
+      "onMultipleTargets": "skip",
+      "ifAssociatedElsewhere": "add",
+      "notes": "Same key as the workflow 'Customer IC Code > Associate to Company' (IC code customer_uid = company epicor_customer_id)."
+    },
+    {
+      "id": "contacts_to_header",
+      "item": "B2",
+      "label": "Contacts to quote header (on quote contact number)",
+      "enabled": false,
+      "from": "quoteHeader",
+      "to": "contact",
+      "match": [
+        { "from": "customerNumber", "to": "customerNumber" },
+        { "from": "quoteContactNumber", "to": "customerContactNumber" }
+      ],
+      "association": { "category": "USER_DEFINED", "typeId": 148 },
+      "onMultipleTargets": "skip",
+      "ifAssociatedElsewhere": "add",
+      "notes": "Disabled until Jitterbit writes the two contact number properties (Item B2 Jitterbit change) and their names are filled in above. Matches the Epicor customer number as well as the contact number because a contact number alone may repeat across customers; remove the first pair to match on the contact number alone."
+    }
+  ],
+  "dealAmount": {
+    "item": "B3",
+    "enabled": true,
+    "header": "quoteHeader",
+    "deal": "deal",
+    "trigger": "header_amount_changed",
+    "amountDependsOnRule": "lines_to_header",
+    "requireOneToOne": true,
+    "skipClosedDeals": true,
+    "requireNewLines": true,
+    "newLinesWindowMinutes": 120,
+    "backfillInFullRun": false,
+    "backlogLinkedLines": "update_deals",
+    "backlogSettleMinutes": 120,
+    "guard": {
+      "holdZeroAmount": true,
+      "holdLargeChange": true,
+      "largeChangeThreshold": 1000000,
+      "holdPercentChange": true,
+      "percentChangeThreshold": 50,
+      "releaseDealIds": [],
+      "notes": "Deal amount changes that are held for review instead of being applied. holdZeroAmount true: a change that would set the deal amount to 0 is held. holdLargeChange true: a change that moves the deal amount by more than largeChangeThreshold, up or down, is held. holdPercentChange true: a change of more than percentChangeThreshold percent of the amount the deal carries now, up or down, is held (exactly that percentage goes through); a deal that carries 0 or no amount has no percentage, so any change to it is held. A held change is listed in every run report and looked at again on every run. To release held changes, set the switch to false or raise the threshold; to release single deals, list their deal record IDs in releaseDealIds. The next run then updates those deals."
+    },
+    "projection": {
+      "enabled": true,
+      "lineAmount": "amount",
+      "notes": "Dry runs only. For quotes that would have lines linked, the report lists the deal amounts that would change afterwards. The new quote amount is worked out as the sum of the amounts of its lines (lineAmount is the name, under objects.quoteLine.properties, of the line amount)."
+    },
+    "notes": "The Epicor Quote amount is a HubSpot rollup of its associated line amounts, so it changes when lines are added, changed or newly associated. amountDependsOnRule makes the middleware re-check the header after its lines change. requireOneToOne true: a deal is only updated when the quote has exactly one deal and that deal exactly one quote. skipClosedDeals true: the amount of a closed deal (closed won or closed lost) is never changed; false updates closed deals too. Associations are still added to closed deals either way. requireNewLines true: a deal amount only follows its quote when the quote gained at least one new line, meaning a line the run linked or a line created in HubSpot since the previous run; an amount that changed without a new line is recorded and the deal left alone. false lets every quote amount change reach the deal. newLinesWindowMinutes: HubSpot recalculates a quote's amount some time after a line is linked, so an amount change seen within this many minutes of the quote gaining a line still counts as caused by it. backfillInFullRun false: quote and deal pairs whose amounts already differ are left alone until the quote amount changes; true makes every reconcile set every differing deal amount (the one-off catch-up, also available for a single run as reconcile --deal-amounts). backlogLinkedLines 'update_deals': when linking lines that were sitting unassociated raises a quote's amount, the deal is updated like any other amount change; 'record_only' records the new amount without changing the deal when the lines are linked by the reconcile command or the very first live run, and backlogSettleMinutes is how long after linking that hold lasts (it is only used with 'record_only')."
+  },
+  "contactCleanup": {
+    "item": "B2",
+    "rule": "contacts_to_header",
+    "requireNamedContactFound": true,
+    "removeOnlyTypeIds": null,
+    "standardContacts": {
+      "enabled": false,
+      "object": "standardContact",
+      "keepLinkedToNamedContact": true,
+      "removeOnlyTypeIds": null,
+      "notes": "Off by default. When true, the one-time cleanup also removes standard Contact associations from the same quote headers, keeping the standard Contact(s) associated to the quote's named Epicor Contact. A header whose named Epicor Contact has no standard Contact is left alone. Covered by the same backup and restore."
+    }
+  }
+}

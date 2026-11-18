@@ -1,0 +1,27 @@
+{
+  "name": "industrious-association-cleanup-middleware",
+  "version": "0.1.0",
+  "description": "Option B v3 association cleanup middleware for Industrious (Items B1 to B3). Works only in HubSpot, on records Jitterbit has already upserted. Postgres staging database, scheduled runs, and a small admin page for alert settings.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node src/cli.js start",
+    "migrate": "node src/cli.js migrate",
+    "run-once": "node src/cli.js run",
+    "reconcile": "node src/cli.js reconcile",
+    "report": "node src/cli.js report",
+    "cleanup-contacts": "node src/cli.js cleanup-contacts",
+    "preflight": "node src/cli.js preflight",
+    "discover": "node src/cli.js discover",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.16"
+  }
+}

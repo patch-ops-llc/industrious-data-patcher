@@ -1,5 +1,6 @@
 {
   "version": 3,
+  "portalId": "44686929",
   "about": "Object types, property names and association type IDs below were read from HubSpot portal 44686929 on 2026-11-12 (read-only review). The match keys for Item B1 are the ones the portal's existing association workflows use. Run `npm run preflight` to re-check them against the portal. The deal quote_num match and the staging database were added on Zach's decisions of 2026-11-12. Keys named 'notes' are documentation only.",
   "keyNormalization": {
     "caseInsensitive": true,

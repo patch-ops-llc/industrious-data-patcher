@@ -14,7 +14,7 @@ export function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => ESCAPES[ch]);
 }
 
-function when(value) {
+export function when(value) {
   if (!value) return '';
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return '';
@@ -22,7 +22,7 @@ function when(value) {
 }
 
 /** 29838 becomes 29,838. Anything that is not a whole number is shown as it is. */
-function count(value) {
+export function count(value) {
   const number = typeof value === 'number' ? value : Number(value);
   if (value === null || value === undefined || value === '' || !Number.isInteger(number)) return esc(value);
   return number.toLocaleString('en-US');
@@ -49,6 +49,52 @@ ${body}
 </body>
 </html>
 `;
+}
+
+/**
+ * The signed-in pages: header with the logo and sign out, the title band with
+ * the mode the service is in, then the page's own content. nav is the list of
+ * sections to link to ([{ href, label, active }]); none when there is only one.
+ */
+export function shell({ title, eyebrow = 'Epicor and HubSpot', heading, sub, csrf, dryRun, nav = [], body, refresh = null }) {
+  const mode = dryRun
+    ? ['dry', 'Dry run', 'Runs change nothing in HubSpot']
+    : ['live', 'Live', 'Runs write to HubSpot'];
+  const links = nav.length
+    ? `<nav class="nav" aria-label="Sections">${nav.map((item) => `<a href="${esc(item.href)}"${item.active ? ' class="active" aria-current="page"' : ''}>${esc(item.label)}</a>`).join('')}</nav>`
+    : '';
+  return page(title, `<header class="top">
+<div class="wrap top-inner">
+${LOGO}
+${links}
+<form method="post" action="/logout"><input type="hidden" name="csrf" value="${esc(csrf)}"><button type="submit" class="quiet">Sign out</button></form>
+</div>
+</header>
+<div class="hero">
+<div class="wrap hero-inner">
+<div>
+<p class="eyebrow">${esc(eyebrow)}</p>
+<h1>${esc(heading)}</h1>
+<p class="hero-sub">${esc(sub)}</p>
+</div>
+<p class="mode ${mode[0]}"><strong>${mode[1]}</strong><span>${mode[2]}</span></p>
+</div>
+</div>
+<main class="wrap">
+${body}
+</main>
+<footer class="foot">
+<div class="wrap">Industrious Group &middot; HubSpot association cleanup</div>
+</footer>`, { refresh });
+}
+
+/** The sections of the admin page. Review is only there when the service handed the page its mapping. */
+export function sections(active, review) {
+  if (!review) return [];
+  return [
+    { href: '/', label: 'Overview', active: active === 'overview' },
+    { href: '/review', label: 'Review', active: active === 'review' },
+  ];
 }
 
 function panelPage(title, inner) {
@@ -95,7 +141,7 @@ function stat(label, value, note, tone = '') {
 </div>`;
 }
 
-const plural = (n, one, many) => `${count(n)} ${n === 1 ? one : many}`;
+export const plural = (n, one, many) => `${count(n)} ${n === 1 ? one : many}`;
 
 const RELOAD_SECONDS = 5;
 
@@ -107,20 +153,25 @@ function share(linked, of) {
   return `${(Math.floor((linked / of) * 1000) / 10).toFixed(1)}%`;
 }
 
-function healthRow(group, dryRun) {
+function healthRow(group, dryRun, review) {
   const n = (value) => Math.max(0, Number(value) || 0);
   const [records, withKey, linked] = [n(group.records), n(group.withKey), n(group.linked)];
   const percent = share(linked, withKey);
   const complete = withKey > 0 && linked >= withKey;
   const width = withKey ? Math.min(100, (linked / withKey) * 100).toFixed(2) : '0';
   const to = esc(group.toLabel);
+  // The records behind a chip are listed on the Review page, under this pair of record types.
+  const listed = review ? `/review#${esc(`${group.from}-${group.to}`.replace(/[^A-Za-z0-9_-]/g, ''))}` : null;
   const rest = [
-    [n(group.pending), 'warn', dryRun ? 'would be linked by a live run' : 'not linked yet'],
-    [n(group.failed), 'bad', 'failed'],
-    [n(group.held), 'warn', 'held for review'],
-    [n(group.noMatch), 'warn', `${n(group.noMatch) === 1 ? 'matches' : 'match'} no ${to}`],
-    [n(group.noKey), 'quiet', n(group.noKey) === 1 ? 'has no ID' : 'have no ID'],
-  ].filter(([value]) => value > 0).map(([value, tone, text]) => `<li class="chip ${tone}"><strong>${count(value)}</strong> ${text}</li>`);
+    [n(group.pending), 'warn', dryRun ? 'would be linked by a live run' : 'not linked yet', false],
+    [n(group.failed), 'bad', 'failed', true],
+    [n(group.held), 'warn', 'held for review', true],
+    [n(group.noMatch), 'warn', `${n(group.noMatch) === 1 ? 'matches' : 'match'} no ${to}`, true],
+    [n(group.noKey), 'quiet', n(group.noKey) === 1 ? 'has no ID' : 'have no ID', true],
+  ].filter(([value]) => value > 0).map(([value, tone, text, onReview]) => {
+    const inner = `<strong>${count(value)}</strong> ${text}`;
+    return `<li class="chip ${tone}">${listed && onReview ? `<a href="${listed}">${inner}</a>` : inner}</li>`;
+  });
   if (complete) rest.unshift(`<li class="chip good">${n(group.noKey) ? 'Every record with an ID is linked' : 'Every record is linked'}</li>`);
   if (!records) rest.push('<li class="chip quiet">No records yet</li>');
   const chips = rest.join('\n');
@@ -142,7 +193,7 @@ ${chips}
 }
 
 /** How many records of each type are linked to the record their ID matches, as the last finished run found it. */
-function healthCard(health) {
+function healthCard(health, review) {
   const groups = Array.isArray(health?.groups) ? health.groups : [];
   if (!groups.length) {
     return `<section class="card">
@@ -158,9 +209,9 @@ function healthCard(health) {
 <h2>Link health</h2>
 <p class="muted">How many records of each type are linked in HubSpot to the record their ID matches. As of the ${kind} finished <span class="nowrap">${esc(when(health.finishedAt))}</span>.${caveat}</p>
 <ul class="health">
-${groups.map((group) => healthRow(group, health.dryRun)).join('\n')}
+${groups.map((group) => healthRow(group, health.dryRun, review)).join('\n')}
 </ul>
-<p class="hint">The percentage is the share of records that carry an ID. Records without an ID cannot be matched and are listed separately.</p>
+<p class="hint">The percentage is the share of records that carry an ID. Records without an ID cannot be matched and are listed separately.${review ? ' The records that are held, unmatched or without an ID are listed under <a href="/review">Review</a>.' : ''}</p>
 </section>`;
 }
 
@@ -189,7 +240,7 @@ ${sync.watching ? '' : '<form method="get" action="/"><input type="hidden" name=
 </div>`;
 }
 
-function lastRunCard(run, sync, hidden) {
+function lastRunCard(run, sync, hidden, review) {
   const controls = syncBlock(sync, hidden);
   if (!run) {
     return `<section class="card">
@@ -264,6 +315,7 @@ ${rules}
 </tbody>
 </table></div>` : ''}
 ${deal}
+${review && (rules || deal) ? '<p class="hint">The records held for review and the records without a match are listed under <a href="/review">Review</a>.</p>' : ''}
 </section>`;
 }
 
@@ -338,39 +390,19 @@ ${options}
 </section>`;
 }
 
-export function dashboardPage({ csrf, run, health = null, alertSettings, alertState, channels, fromAddress, service, password, sync = null, form = null, notice = null, error = null, maxRecipients }) {
+export function dashboardPage({ csrf, run, health = null, review = false, alertSettings, alertState, channels, fromAddress, service, password, sync = null, form = null, notice = null, error = null, maxRecipients }) {
   const values = form || {
     enabled: alertSettings.enabled,
     recipients: alertSettings.emailRecipients.join('\n'),
     repeatMinutes: String(alertSettings.repeatMinutes),
   };
   const hidden = `<input type="hidden" name="csrf" value="${esc(csrf)}">`;
-  const mode = service.dryRun
-    ? ['dry', 'Dry run', 'Runs change nothing in HubSpot']
-    : ['live', 'Live', 'Runs write to HubSpot'];
   const refresh = sync?.running && sync.watching ? { seconds: RELOAD_SECONDS, url: '/?watch=run' } : null;
-  return page('Association cleanup', `<header class="top">
-<div class="wrap top-inner">
-${LOGO}
-<form method="post" action="/logout">${hidden}<button type="submit" class="quiet">Sign out</button></form>
-</div>
-</header>
-<div class="hero">
-<div class="wrap hero-inner">
-<div>
-<p class="eyebrow">Epicor and HubSpot</p>
-<h1>Association cleanup</h1>
-<p class="hero-sub">${sync ? 'Link health, runs, schedule and alerts' : 'Link health, run status and alerts'}</p>
-</div>
-<p class="mode ${mode[0]}"><strong>${mode[1]}</strong><span>${mode[2]}</span></p>
-</div>
-</div>
-<main class="wrap">
-${notice ? `<p class="notice good" role="status">${esc(notice)}</p>` : ''}
+  const body = `${notice ? `<p class="notice good" role="status">${esc(notice)}</p>` : ''}
 ${error ? `<p class="notice bad" role="alert">${esc(error)}</p>` : ''}
 ${refresh ? `<p class="notice info" role="status">A run is in progress. This page reloads every ${RELOAD_SECONDS} seconds until it finishes.</p>` : ''}
-${healthCard(health)}
-${lastRunCard(run, sync, hidden)}
+${healthCard(health, review)}
+${lastRunCard(run, sync, hidden, review)}
 <div class="columns">
 <div class="column">
 ${scheduleCard(sync, hidden)}
@@ -410,9 +442,15 @@ ${passwordCard(password, hidden)}
     : 'The mode, the schedule, the field mappings and all keys are service settings and cannot be changed here.'}</p>
 </section>
 </div>
-</div>
-</main>
-<footer class="foot">
-<div class="wrap">Industrious Group &middot; HubSpot association cleanup</div>
-</footer>`, { refresh });
+</div>`;
+  return shell({
+    title: 'Association cleanup',
+    heading: 'Association cleanup',
+    sub: sync ? 'Link health, runs, schedule and alerts' : 'Link health, run status and alerts',
+    csrf,
+    dryRun: service.dryRun,
+    nav: sections('overview', review),
+    body,
+    refresh,
+  });
 }

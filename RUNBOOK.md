@@ -38,7 +38,7 @@ On a deploy the old copy is told to stop and is given two minutes to finish its 
 
 ## Where to look
 
-- **Admin page** (the service's public address): link health (how many records of each type are linked to the record their ID matches, with the share as a percentage), status and counts of the last run, "Sync now", the schedule, alert settings, test alert, and changing the page's password.
+- **Admin page** (the service's public address): link health (how many records of each type are linked to the record their ID matches, with the share as a percentage), status and counts of the last run, "Sync now", the schedule, alert settings, test alert, and changing the page's password. Under **Review**: the records that are held for review, unmatched or without an ID, per kind of record, each with a link that opens it in HubSpot and a CSV download, and the deal amount changes the guard holds, which can be released there. The lists are as the last live run left them.
 - **Service log:** JSON lines in Railway under the service. Each run logs `run started`, one `rule processed` line per association with its counts, one `link health` line per kind of record (`records`, `withKey`, `linked`, `pending`, `failed`, `held`, `noMatch`, `noKey`), `deal amounts processed`, and `run finished` with the status.
 - **Last report:** `node src/cli.js report` in a shell on the service (`railway ssh`), or `report <run id>` for an earlier run.
 - **Staging database** (Railway's data view, or any Postgres client):
@@ -67,7 +67,8 @@ WHERE from_object_type = '2-45361208' AND to_object_type = 'deals'
 GROUP BY from_id HAVING count(*) > 1;
 
 -- deal amount changes held for review by the guard (still open)
-SELECT deal_id, header_id AS quote_id, amount_before AS deal_amount, amount_after AS quote_amount, reasons, first_held_at
+SELECT deal_id, header_id AS quote_id, amount_before AS deal_amount, amount_after AS quote_amount, reasons, first_held_at,
+       released_at, released_amount  -- set when the change was released on the admin page and waits for a live run
 FROM deal_amount_holds WHERE resolved_at IS NULL ORDER BY first_held_at;
 
 -- quotes that gained a line recently: read again on every run, and an amount change still reaches the deal
@@ -75,7 +76,8 @@ SELECT header_id AS quote_id, amount AS recorded_quote_amount, new_lines_until
 FROM deal_amount_baselines WHERE new_lines_until > now() ORDER BY new_lines_until;
 
 -- held changes that came off the list, and how
-SELECT deal_id, header_id AS quote_id, amount_before, amount_after, resolution, resolved_at
+SELECT deal_id, header_id AS quote_id, amount_before, amount_after, resolution, resolved_at,
+       released_at  -- set: it was released on the admin page and applied for released_amount
 FROM deal_amount_holds WHERE resolved_at IS NOT NULL ORDER BY resolved_at DESC;
 
 -- every association the service created in the last day
@@ -137,7 +139,7 @@ To bring one deal in line with its quote by hand, set the deal amount in HubSpot
 
 **The report lists deal amount changes held for review.** The guard held them: the change would set the deal to 0, move it by more than 1,000,000, or change it by more than 50% of what the deal carries now (`dealAmount.guard` in `config/mapping.json`). A deal that carries 0 or no amount is always held, because no percentage can be worked out for it. The deals were not changed. Each held change is listed in every run report with the deal, the quote, the deal amount now, the quote amount that was not applied, the reason and the date it was first held; the alert and log summary of each run gives the count, and the query above lists them. For each one, decide:
 
-- The quote amount is right: release it. Add the deal record ID to `dealAmount.guard.releaseDealIds`, or release a whole kind by setting `holdZeroAmount`, `holdLargeChange` or `holdPercentChange` to `false` or raising `largeChangeThreshold` or `percentChangeThreshold`. Deploy, run `reconcile` as a dry run to see what would be applied, and let the next live run apply it. A switch that is turned off stays off for later changes too; `releaseDealIds` releases only the deals listed, for as long as they are listed.
+- The quote amount is right: release it. On the admin page, under Review, open "Deal amount changes held", tick the change, choose "Release selected" and confirm; the next live run (or "Sync now") sets the deal to that amount. The release is for the amount shown: if the quote amount changes first, the change is held again. It can be cancelled on the same list until a run has applied it. To release without the page, or a whole kind at once: add the deal record ID to `dealAmount.guard.releaseDealIds`, or release a whole kind by setting `holdZeroAmount`, `holdLargeChange` or `holdPercentChange` to `false` or raising `largeChangeThreshold` or `percentChangeThreshold`. Deploy, run `reconcile` as a dry run to see what would be applied, and let the next live run apply it. A switch that is turned off stays off for later changes too; `releaseDealIds` releases only the deals listed, for as long as they are listed.
 - The deal amount is right: leave it. The change stays on the list. It comes off by itself when the quote and the deal agree again, the deal is closed, or the quote amount changes to one the guard does not catch.
 
 A held change that comes off the list is named in that run's report as applied or as no longer applying, and its row in `deal_amount_holds` is kept with `resolution` filled in.

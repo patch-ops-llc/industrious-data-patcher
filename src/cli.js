@@ -175,7 +175,7 @@ async function commandStart(cli) {
     runNow: () => (scheduler ? scheduler.runNow() : { started: false, reason: 'starting' }),
     setSchedule: (schedule) => scheduler?.setSchedule(schedule),
   };
-  const admin = createAdminServer({ db, settings, alerter, logger, runs });
+  const admin = createAdminServer({ db, settings, alerter, logger, runs, mapping: ctx.mapping });
   const address = await admin.listen(settings.port);
   const alertSettings = await getAlertSettings(db);
   const channels = alerter.status(alertSettings.emailRecipients);

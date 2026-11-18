@@ -329,6 +329,32 @@ export async function openReviewItems(db, ruleId) {
   return rows.map((row) => ({ id: row.hubspot_id, status: row.status, key: row.match_key, detail: row.detail, firstSeenAt: row.first_seen_at }));
 }
 
+const reviewItemRow = (row) => ({ id: row.hubspot_id, status: row.status, key: row.match_key, detail: row.detail, firstSeenAt: iso(row.first_seen_at) });
+
+/**
+ * Open review items of one rule and one reason, newest first (admin page).
+ * limit null returns them all, up to max.
+ */
+export async function reviewItemsList(db, { ruleId, status, limit = null, offset = 0, max = 100_000 }) {
+  const { rows } = await db.query(
+    `SELECT hubspot_id, status, match_key, detail, first_seen_at FROM review_items
+     WHERE rule_id = $1 AND status = $2 AND resolved_at IS NULL
+     ORDER BY first_seen_at DESC, length(hubspot_id), hubspot_id LIMIT $3 OFFSET $4`,
+    [ruleId, status, limit ?? max, offset],
+  );
+  return rows.map(reviewItemRow);
+}
+
+/** When the review lists were last brought up to date: when the latest live run that saved its findings finished. */
+export async function reviewListsAsOf(db) {
+  const { rows } = await db.query(
+    `SELECT started_at, finished_at FROM runs
+     WHERE state_saved AND NOT dry_run AND mode IN ('incremental', 'full') AND finished_at IS NOT NULL
+     ORDER BY started_at DESC LIMIT 1`,
+  );
+  return rows.length ? iso(rows[0].finished_at) : null;
+}
+
 // ---- deal amount baselines (Item B3) ---------------------------------------
 
 /** { headerId: { amount, recheck } } for the given headers, or for every header when ids is null. */
@@ -474,6 +500,48 @@ export async function releaseDealAmountHolds(db, { items, now }) {
     [JSON.stringify(items.map((item) => ({ id: String(item.id), amount: String(item.amount ?? '') }))), iso(now)],
   );
   return rows.map(holdRow);
+}
+
+const HOLD_COLUMNS = 'h.id, h.deal_id, h.header_id, h.amount_before, h.amount_after, h.reasons, h.first_held_at, h.last_seen_at, h.released_at, h.released_amount';
+
+/** { open, released }: changes held now, and how many of them are released and waiting for a run. */
+export async function dealAmountHoldCounts(db) {
+  const { rows } = await db.query(
+    'SELECT count(*)::int AS open, count(released_at)::int AS released FROM deal_amount_holds WHERE resolved_at IS NULL',
+  );
+  return { open: rows[0].open, released: rows[0].released };
+}
+
+/**
+ * Changes held now, oldest first, each with the quote number of its quote
+ * header from the staging copy (admin page). ids: only these holds.
+ * waiting: only holds that are not released yet. limit null returns them all, up to max.
+ */
+export async function dealAmountHoldsList(db, { headerKey = null, quoteNumberProperty = null, ids = null, waiting = false, limit = null, offset = 0, max = 100_000 } = {}) {
+  const { rows } = await db.query(
+    `SELECT ${HOLD_COLUMNS}, s.properties ->> $2 AS quote_number
+     FROM deal_amount_holds h
+     LEFT JOIN staging_records s ON s.object_key = $1 AND s.hubspot_id = h.header_id
+     WHERE h.resolved_at IS NULL
+       AND ($3::jsonb IS NULL OR h.id::text = ANY(ARRAY(SELECT jsonb_array_elements_text($3::jsonb))))
+       AND (NOT $4::boolean OR h.released_at IS NULL)
+     ORDER BY h.first_held_at, h.id LIMIT $5 OFFSET $6`,
+    [headerKey, quoteNumberProperty, ids ? idList(ids) : null, waiting, limit ?? max, offset],
+  );
+  return rows.map((row) => ({ ...holdRow(row), quoteNumber: row.quote_number ?? '' }));
+}
+
+/** The changes released on the admin page that a run has applied, latest first: what became of a release. */
+export async function appliedDealAmountReleases(db, { headerKey = null, quoteNumberProperty = null, limit = 20 } = {}) {
+  const { rows } = await db.query(
+    `SELECT ${HOLD_COLUMNS}, h.resolved_at, s.properties ->> $2 AS quote_number
+     FROM deal_amount_holds h
+     LEFT JOIN staging_records s ON s.object_key = $1 AND s.hubspot_id = h.header_id
+     WHERE h.resolution = 'applied' AND h.released_at IS NOT NULL
+     ORDER BY h.resolved_at DESC, h.id DESC LIMIT $3`,
+    [headerKey, quoteNumberProperty, limit],
+  );
+  return rows.map((row) => ({ ...holdRow(row), quoteNumber: row.quote_number ?? '', appliedAt: iso(row.resolved_at) }));
 }
 
 /** Takes a release back, as long as no run has applied it. Returns the hold, or null when there was nothing to take back. */

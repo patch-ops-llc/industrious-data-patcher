@@ -324,6 +324,17 @@ test('CLI: the service answers the health check and the admin page, runs straigh
       assert.equal((health.match(/<p class="health-share good">100%<\/p>\n<p class="health-count"><strong>1<\/strong> of 1 linked<\/p>/g) || []).length, 4);
       assert.match(health, /Matched on <code>hubspot_deal_id<\/code> or <code>quote_number<\/code>\./);
       assert.ok(!page.includes(TOKEN) && !page.includes(password));
+      // The service hands the page its mapping, so the Review section is there, with the portal's record types.
+      assert.match(page, /<a href="\/review">Review<\/a><\/nav>/);
+      const review = await fetch(`${base}/review`, { headers: { cookie } });
+      assert.equal(review.status, 200);
+      const reviewText = await review.text();
+      assert.match(reviewText, /As of the live run finished/);
+      assert.match(reviewText, /<section class="review-pair" id="quoteHeader-deal">\n<h3>Epicor Quote <span class="health-to">to<\/span> Deal<\/h3>/);
+      assert.match(reviewText, /No deal amount change is held\./);
+      const heldPage = await fetch(`${base}/review/deal-amounts`, { headers: { cookie } });
+      assert.equal(heldPage.status, 200);
+      assert.ok(!reviewText.includes(TOKEN) && !reviewText.includes(password));
     } finally {
       service.child.kill('SIGTERM');
     }

@@ -1,75 +1,16 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { after, test } from 'node:test';
+import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { hashPassword, verifyPassword } from '../src/admin/password.js';
-import { createAdminServer } from '../src/admin/server.js';
-import { createAlerter } from '../src/alerts.js';
 import { loadSettings } from '../src/config.js';
 import { finishRun, getAdminPassword, getAlertSettings, getAlertState, getScheduleSettings, insertRun, saveAlertSettings, saveScheduleSettings } from '../src/db/store.js';
 import { executeRun } from '../src/engine/run.js';
 import { effectiveSchedule } from '../src/schedule.js';
 import { startScheduler } from '../src/scheduler.js';
+import { SECRETS, startAdmin } from './admin-helpers.js';
 import { addQuoteFamily, makeHarness, T } from './helpers.js';
-
-const SECRETS = {
-  HUBSPOT_PRIVATE_APP_TOKEN: 'test-HUBSPOT-SECRET-0001',
-  ADMIN_PASSWORD: 'correct horse battery staple',
-  RESEND_API_KEY: 're_test_RESEND-SECRET-0002',
-  ALERT_SLACK_WEBHOOK_URL: 'https://hooks.slack.test/services/T000/B000/SLACK-SECRET-0003',
-  DATABASE_URL: 'postgres://app:DB-SECRET-0004@db.internal:5432/railway',
-};
-
-// A failed assertion skips the test's own close(); this keeps a failing test from leaving the process running.
-const openServers = new Set();
-after(async () => {
-  for (const admin of openServers) await admin.close().catch(() => {});
-});
-
-async function startAdmin(h, { env = {}, fetchImpl, now, runs = null } = {}) {
-  const settings = loadSettings({ ...SECRETS, ALERT_EMAIL_FROM: 'alerts@patchops.example', ...env });
-  const sent = [];
-  const alerter = createAlerter(settings.alerts, {
-    fetchImpl: fetchImpl || (async (url, init) => {
-      sent.push({ url: String(url), headers: init.headers, body: JSON.parse(init.body) });
-      return new Response(JSON.stringify({ id: 'email_123' }), { status: 200 });
-    }),
-  });
-  const admin = createAdminServer({ db: h.db, settings, alerter, logger: h.ctx().logger, now, runs });
-  openServers.add(admin);
-  const address = await admin.listen(0, '127.0.0.1');
-  const base = `http://127.0.0.1:${address.port}`;
-  const bodies = [];
-
-  async function request(method, url, { cookie, form, headers = {}, raw } = {}) {
-    const init = { method, redirect: 'manual', headers: { ...headers } };
-    if (cookie) init.headers.cookie = cookie;
-    if (form) {
-      init.headers['content-type'] = 'application/x-www-form-urlencoded';
-      init.body = new URLSearchParams(form).toString();
-    }
-    if (raw !== undefined) init.body = raw;
-    const response = await fetch(base + url, init);
-    const text = await response.text();
-    bodies.push(text, JSON.stringify([...response.headers.entries()]));
-    return { status: response.status, headers: response.headers, text };
-  }
-
-  async function login(password = SECRETS.ADMIN_PASSWORD) {
-    const response = await request('POST', '/login', { form: { password } });
-    const setCookie = response.headers.get('set-cookie');
-    const cookie = setCookie ? setCookie.split(';')[0] : null;
-    let csrf = null;
-    if (cookie) {
-      const page = await request('GET', '/', { cookie });
-      csrf = page.text.match(/name="csrf" value="([^"]+)"/)?.[1] || null;
-    }
-    return { response, setCookie, cookie, csrf };
-  }
-
-  return { admin, base, request, login, sent, bodies, settings, close: async () => { openServers.delete(admin); await admin.close(); } };
-}
 
 test('admin: nothing but the health check, the page assets and the sign-in page is reachable without signing in', async () => {
   const h = await makeHarness();
@@ -583,6 +524,9 @@ test('admin: the admin code cannot reach HubSpot itself; without the run control
   // alerts.js, the only other module it uses that sends anything, does not import them either.
   const alerts = fs.readFileSync(path.join(dir, '..', 'alerts.js'), 'utf8');
   assert.doesNotMatch(alerts, /hubspot\/|engine\//);
+  // Nor does review.js, which only works out record links and labels from the mapping.
+  const review = fs.readFileSync(path.join(dir, '..', 'review.js'), 'utf8');
+  assert.doesNotMatch(review, /from '\.\/(hubspot|engine)\/|HubSpotClient|HubSpotApi|executeRun|fetch\(/);
   await a.close();
   await h.cleanup();
 });

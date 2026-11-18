@@ -4,9 +4,29 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { sendTestAlert } from '../alerts.js';
 import { MAX_EMAIL_RECIPIENTS, parseEmailList } from '../config.js';
-import { clearAdminPassword, getAdminPassword, getAlertSettings, getAlertState, lastLinkHealth, lastRun, saveAdminPassword, saveAlertSettings, saveScheduleSettings } from '../db/store.js';
+import {
+  appliedDealAmountReleases,
+  cancelDealAmountRelease,
+  clearAdminPassword,
+  dealAmountHoldCounts,
+  dealAmountHoldsList,
+  getAdminPassword,
+  getAlertSettings,
+  getAlertState,
+  lastLinkHealth,
+  lastRun,
+  openReviewCounts,
+  releaseDealAmountHolds,
+  reviewItemsList,
+  reviewListsAsOf,
+  saveAdminPassword,
+  saveAlertSettings,
+  saveScheduleSettings,
+} from '../db/store.js';
+import { recordUrl, REVIEW_STATUSES, reviewCatalog } from '../review.js';
 import { effectiveSchedule, intervalChoices, intervalLabel } from '../schedule.js';
 import { hashPassword, verifyPassword } from './password.js';
+import { dealAmountsPage, holdReasons, reasonTitle, recordsPage, releaseConfirmPage, reviewPage } from './reviewViews.js';
 import { dashboardPage, loginPage, messagePage } from './views.js';
 
 /**
@@ -15,7 +35,11 @@ import { dashboardPage, loginPage, messagePage } from './views.js';
  * It can switch alerts on and off, set the email recipients and the repeat
  * interval, send a test alert, show the last run's status, change its own
  * password, pause the schedule or pick its interval from a fixed list, and
- * start a run now ("Sync now").
+ * start a run now ("Sync now"). Under Review it lists the records a run held
+ * for review or could not match and the deal amount changes the guard holds,
+ * read from the staging database, and a held deal amount change can be
+ * released there: that is recorded in the staging database, and the service's
+ * next run applies it.
  *
  * This module does not import the HubSpot client or the run engine. The one
  * way it reaches HubSpot is by asking the service's scheduler, handed in as
@@ -40,6 +64,10 @@ const LOGIN_WINDOW_MS = 15 * 60_000;
 const MAX_FAILED_LOGINS = 10;
 const TEST_COOLDOWN_MS = 20_000;
 const MAX_SESSIONS = 100;
+const REVIEW_PAGE_SIZE = 100;
+// As many held changes as one page lists can be released in one go.
+const MAX_RELEASE = REVIEW_PAGE_SIZE;
+const HOLD_ID = /^\d{1,18}$/;
 
 const file = (name) => fs.readFileSync(fileURLToPath(new URL(name, import.meta.url)));
 const DAY_SECONDS = 86_400;
@@ -97,6 +125,24 @@ async function readForm(req) {
   return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
 }
 
+/**
+ * One CSV cell. A value a spreadsheet would run as a formula (it starts with
+ * =, +, - or @) is written with a leading apostrophe so it stays text; plain
+ * numbers are left as they are.
+ */
+function csvCell(value) {
+  let text = String(value ?? '');
+  if (/^[=+\-@\t\r]/.test(text) && !/^-?\d+(\.\d+)?$/.test(text)) text = `'${text}`;
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+const csvText = (rows) => `\uFEFF${rows.map((row) => row.map(csvCell).join(',')).join('\r\n')}\r\n`;
+
+function pageNumberOf(value, pageCount) {
+  const n = /^\d{1,6}$/.test(String(value ?? '')) ? Number(value) : 1;
+  return Math.min(Math.max(1, n), Math.max(1, pageCount));
+}
+
 /** Removes any configured secret value that might have ended up in a text (for example in an error message). */
 function redactor(settings) {
   const secrets = [
@@ -115,9 +161,11 @@ function redactor(settings) {
 
 /**
  * runs is the service's scheduler ({ runNow, setSchedule, status }). Without
- * it the page has no Sync now button and no schedule controls.
+ * it the page has no Sync now button and no schedule controls. mapping is the
+ * service's mapping; without it the page has no Review section.
  */
-export function createAdminServer({ db, settings, alerter, logger, runs = null, now = () => new Date() }) {
+export function createAdminServer({ db, settings, alerter, logger, runs = null, mapping = null, now = () => new Date() }) {
+  const catalog = mapping ? reviewCatalog(mapping) : null;
   const password = settings.adminPassword || '';
   const enabled = password.length >= MIN_PASSWORD_LENGTH;
   const sessionMs = settings.adminSessionHours * 3_600_000;
@@ -270,8 +318,154 @@ export function createAdminServer({ db, settings, alerter, logger, runs = null, 
       form,
       notice,
       error,
+      review: Boolean(catalog),
       maxRecipients: MAX_EMAIL_RECIPIENTS,
     }));
+  }
+
+  // ---- Review ---------------------------------------------------------------
+
+  const notFound = (res) => send(res, 404, messagePage('Not found', 'There is no page at this address.'));
+  const sendCsv = (res, name, rows) => send(res, 200, csvText(rows), {
+    'content-type': 'text/csv; charset=utf-8',
+    'content-disposition': `attachment; filename="${name}-${now().toISOString().slice(0, 10)}.csv"`,
+  });
+
+  async function renderReview(res, session) {
+    const [counts, holds, asOf] = await Promise.all([
+      openReviewCounts(db),
+      catalog.dealAmount ? dealAmountHoldCounts(db) : { open: 0, released: 0 },
+      reviewListsAsOf(db),
+    ]);
+    return send(res, 200, reviewPage({ csrf: session.csrf, dryRun: settings.dryRun, catalog, counts, holds, asOf }));
+  }
+
+  /** The rule and reason a list address names, or null when it names none this service has. */
+  function listOf(url) {
+    const rule = catalog.rules.find((r) => r.id === url.searchParams.get('rule'));
+    const status = url.searchParams.get('status');
+    return rule && REVIEW_STATUSES.includes(status) ? { rule, status } : null;
+  }
+
+  async function renderRecords(res, session, url) {
+    const list = listOf(url);
+    if (!list) return notFound(res);
+    const { rule, status } = list;
+    const total = (await openReviewCounts(db)).find((c) => c.ruleId === rule.id && c.status === status)?.count ?? 0;
+    const pageCount = Math.ceil(total / REVIEW_PAGE_SIZE);
+    const pageNumber = pageNumberOf(url.searchParams.get('page'), pageCount);
+    const items = await reviewItemsList(db, { ruleId: rule.id, status, limit: REVIEW_PAGE_SIZE, offset: (pageNumber - 1) * REVIEW_PAGE_SIZE });
+    return send(res, 200, recordsPage({ csrf: session.csrf, dryRun: settings.dryRun, catalog, rule, status, items, total, pageNumber, pageCount, pageSize: REVIEW_PAGE_SIZE }));
+  }
+
+  async function downloadRecords(res, url) {
+    const list = listOf(url);
+    if (!list) return notFound(res);
+    const { rule, status } = list;
+    const items = await reviewItemsList(db, { ruleId: rule.id, status });
+    const rows = [[`${rule.from.label} record ID`, 'HubSpot link', 'Reason', 'ID on the record', 'Detail', 'On the list since']];
+    for (const item of items) {
+      rows.push([item.id, recordUrl(catalog.portalId, rule.from.objectType, item.id) ?? '', reasonTitle(status), item.key, item.detail, item.firstSeenAt]);
+    }
+    return sendCsv(res, `review-${rule.id.replace(/[^A-Za-z0-9_-]/g, '')}-${status}`, rows);
+  }
+
+  const holdQuery = (extra) => ({ headerKey: catalog.dealAmount.header.key, quoteNumberProperty: catalog.dealAmount.quoteNumberProperty, ...extra });
+
+  async function renderDealAmounts(res, session, { url = null, status = 200, notice = null, error = null } = {}) {
+    const counts = await dealAmountHoldCounts(db);
+    const pageCount = Math.ceil(counts.open / REVIEW_PAGE_SIZE);
+    const pageNumber = pageNumberOf(url?.searchParams.get('page'), pageCount);
+    const holds = await dealAmountHoldsList(db, holdQuery({ limit: REVIEW_PAGE_SIZE, offset: (pageNumber - 1) * REVIEW_PAGE_SIZE }));
+    const applied = await appliedDealAmountReleases(db, holdQuery({ limit: 20 }));
+    return send(res, status, dealAmountsPage({ csrf: session.csrf, dryRun: settings.dryRun, catalog, holds, applied, counts, pageNumber, pageCount, pageSize: REVIEW_PAGE_SIZE, notice, error }));
+  }
+
+  async function downloadDealAmounts(res) {
+    const { header, deal } = catalog.dealAmount;
+    const holds = await dealAmountHoldsList(db, holdQuery());
+    const rows = [['Deal ID', 'Deal link', 'Quote record ID', 'Quote link', 'Quote number', 'Deal amount now', 'Quote amount (not applied)', 'Why held', 'Held since', 'Released']];
+    for (const hold of holds) {
+      rows.push([
+        hold.dealId, recordUrl(catalog.portalId, deal.objectType, hold.dealId) ?? '',
+        hold.headerId, recordUrl(catalog.portalId, header.objectType, hold.headerId) ?? '',
+        hold.quoteNumber, hold.from, hold.to, holdReasons(catalog, hold.reasons), hold.firstHeldAt, hold.releasedAt ?? '',
+      ]);
+    }
+    return sendCsv(res, 'held-deal-amounts', rows);
+  }
+
+  /** The step before a release: shows the chosen changes. Changes nothing. */
+  async function renderReleaseConfirm(res, session, url) {
+    let holds;
+    let missing = 0;
+    if (url.searchParams.get('all') === '1') {
+      holds = await dealAmountHoldsList(db, holdQuery({ waiting: true, limit: MAX_RELEASE }));
+    } else {
+      const ids = [...new Set(url.searchParams.getAll('hold').filter((id) => HOLD_ID.test(id)))].slice(0, MAX_RELEASE);
+      holds = ids.length ? await dealAmountHoldsList(db, holdQuery({ ids, waiting: true })) : [];
+      missing = ids.length - holds.length;
+    }
+    return send(res, 200, releaseConfirmPage({ csrf: session.csrf, dryRun: settings.dryRun, catalog, holds, notFound: missing }));
+  }
+
+  /**
+   * Releases the confirmed changes. Each one is released only while it is
+   * still held for the amount the confirmation page showed. This writes to the
+   * staging database; the deal is changed by the service's next live run.
+   */
+  async function handleRelease(req, res, session, form) {
+    const chosen = new Map();
+    for (const value of form.getAll('hold').slice(0, MAX_RELEASE * 2)) {
+      const at = value.indexOf(':');
+      const id = value.slice(0, at);
+      const amount = value.slice(at + 1);
+      if (at > 0 && HOLD_ID.test(id) && amount.length <= 40 && chosen.size < MAX_RELEASE) chosen.set(id, amount);
+    }
+    if (chosen.size === 0) return renderDealAmounts(res, session, { status: 400, error: 'Nothing was released: no change was chosen.' });
+    const released = await releaseDealAmountHolds(db, { items: [...chosen].map(([id, amount]) => ({ id, amount })), now: now() });
+    const left = chosen.size - released.length;
+    logger?.info('deal amount changes released on the admin page', { released: released.length, notReleased: left, dealIds: released.slice(0, 50).map((hold) => hold.dealId) });
+    return redirect(res, `/review/deal-amounts?notice=released&n=${released.length}&left=${left}`);
+  }
+
+  async function handleCancelRelease(req, res, session, form) {
+    const id = form.get('hold') || '';
+    if (!HOLD_ID.test(id)) return renderDealAmounts(res, session, { status: 400, error: 'Not cancelled: that is not a held change.' });
+    // A run reads the releases when it gets to the deal amounts; cancelling under it would not stop it.
+    if (runs?.status()?.running) {
+      return renderDealAmounts(res, session, { status: 409, error: 'Not cancelled: a run is in progress and may already be applying this release. Try again when it has finished.' });
+    }
+    const hold = await cancelDealAmountRelease(db, id);
+    if (!hold) return renderDealAmounts(res, session, { status: 409, error: 'Not cancelled: that change is no longer released. A run may have applied it already.' });
+    logger?.info('deal amount release cancelled on the admin page', { dealId: hold.dealId });
+    return redirect(res, '/review/deal-amounts?notice=release_cancelled');
+  }
+
+  function releaseNotice(url) {
+    const kind = url.searchParams.get('notice');
+    if (kind === 'release_cancelled') return { notice: 'Release cancelled. The change is held again.' };
+    if (kind !== 'released') return {};
+    const smallCount = (name) => (/^\d{1,6}$/.test(url.searchParams.get(name) || '') ? Number(url.searchParams.get(name)) : 0);
+    const released = smallCount('n');
+    const left = smallCount('left');
+    const applied = settings.dryRun ? 'The first live run applies' : 'The next run applies';
+    const notice = released ? `${released} deal amount ${released === 1 ? 'change' : 'changes'} released. ${applied} ${released === 1 ? 'it' : 'them'}.` : null;
+    const error = left ? `${left} ${left === 1 ? 'change was' : 'changes were'} not released: no longer held, already released, or the quote amount changed. Check the list.` : null;
+    return { notice, error };
+  }
+
+  async function routeReviewGet(res, session, url) {
+    const path = url.pathname;
+    if (path === '/review') return renderReview(res, session);
+    if (path === '/review/records') return renderRecords(res, session, url);
+    if (path === '/review/records.csv') return downloadRecords(res, url);
+    if (catalog.dealAmount) {
+      if (path === '/review/deal-amounts') return renderDealAmounts(res, session, { url, ...releaseNotice(url) });
+      if (path === '/review/deal-amounts.csv') return downloadDealAmounts(res);
+      if (path === '/review/deal-amounts/release') return renderReleaseConfirm(res, session, url);
+    }
+    return notFound(res);
   }
 
   async function handleLogin(req, res) {
@@ -422,7 +616,8 @@ export function createAdminServer({ db, settings, alerter, logger, runs = null, 
     }
 
     if (method === 'GET') {
-      if (path !== '/') return send(res, 404, messagePage('Not found', 'There is no page at this address.'));
+      if (catalog && path.startsWith('/review')) return routeReviewGet(res, session, url);
+      if (path !== '/') return notFound(res);
       // After Sync now the page reloads itself until the run is over, then says so.
       const watching = Boolean(runs) && url.searchParams.get('watch') === 'run';
       if (watching && !runs.status()?.running) return redirect(res, '/?notice=run_finished');
@@ -442,7 +637,9 @@ export function createAdminServer({ db, settings, alerter, logger, runs = null, 
     if (path === '/password') return handleChangePassword(req, res, session, form);
     if (runs && path === '/run') return handleRunNow(req, res, session);
     if (runs && path === '/schedule') return handleSaveSchedule(req, res, session, form);
-    return send(res, 404, messagePage('Not found', 'There is no page at this address.'));
+    if (catalog?.dealAmount && path === '/review/deal-amounts/release') return handleRelease(req, res, session, form);
+    if (catalog?.dealAmount && path === '/review/deal-amounts/cancel') return handleCancelRelease(req, res, session, form);
+    return notFound(res);
   }
 
   const server = http.createServer((req, res) => {

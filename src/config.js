@@ -117,6 +117,8 @@ export function normalizeMapping(input) {
   const mapping = structuredClone(input);
   mapping.objects ??= {};
   mapping.rules ??= [];
+  // The HubSpot portal (account) ID. Only used to link to records from the admin page.
+  mapping.portalId = mapping.portalId === undefined || mapping.portalId === null || mapping.portalId === '' ? null : String(mapping.portalId).trim();
   mapping.keyNormalization = { caseInsensitive: true, treatAsBlank: [], ...(mapping.keyNormalization || {}) };
   mapping.keyNormalization.treatAsBlank = (mapping.keyNormalization.treatAsBlank || []).map((v) => String(v).trim().toLowerCase());
   for (const obj of Object.values(mapping.objects)) {
@@ -259,6 +261,7 @@ export function mappingProblems(mapping, { forCleanup = false } = {}) {
     if (ids.has(rule.id)) problems.push(`rule id "${rule.id}" is used more than once`);
     ids.add(rule.id);
   }
+  if (mapping.portalId !== null && !/^\d{1,15}$/.test(mapping.portalId)) problems.push('portalId must be the HubSpot portal (account) ID: digits only');
   const active = enabledRules(mapping);
   if (active.length === 0 && !forCleanup) problems.push('no rules are enabled');
   for (const rule of active) checkRule(mapping, rule, problems);

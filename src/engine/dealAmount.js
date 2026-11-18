@@ -34,12 +34,13 @@ export function newDealAmountStats() {
     held: [],
     holdsReleased: [],
     holdsNoLongerApply: [],
+    releasesLapsed: [],
     projection: null,
     failures: [],
   };
 }
 
-function sameAmount(a, b) {
+export function sameAmount(a, b) {
   const x = toNumber(a);
   const y = toNumber(b);
   if (x === null && y === null) return true;
@@ -58,10 +59,16 @@ function amountText(value) {
  * amount counts as 0 when measuring the size of the change. The percentage is
  * taken of the deal's current amount; with a current amount of 0 or blank no
  * percentage exists, and any change counts as over the percentage.
+ *
+ * released: changes released on the admin page, as a Map of deal ID to
+ * { headerId, amount }. A release lets through the change to exactly that
+ * amount from that quote, and nothing else.
  */
-export function guardReasons(cfg, { dealId, from, to }) {
+export function guardReasons(cfg, { dealId, headerId, from, to }, released = null) {
   const guard = cfg.guard || {};
   if ((guard.releaseDealIds || []).some((id) => String(id) === String(dealId))) return [];
+  const release = released?.get(String(dealId));
+  if (release && String(release.headerId) === String(headerId) && toNumber(to) !== null && sameAmount(release.amount, to)) return [];
   const before = toNumber(from) ?? 0;
   const after = toNumber(to);
   const reasons = [];
@@ -85,7 +92,7 @@ export function guardReasons(cfg, { dealId, from, to }) {
  * (skipClosedDeals). Deals already in sync and the skipped cases are counted
  * in stats.
  */
-export async function evaluateDealChanges(ctx, headers, { plannedLinks = [], withDealState = false } = {}, stats) {
+export async function evaluateDealChanges(ctx, headers, { plannedLinks = [], withDealState = false, released = null } = {}, stats) {
   const { api, mapping } = ctx;
   const cfg = mapping.dealAmount;
   const headerObj = mapping.objects[cfg.header];
@@ -162,7 +169,7 @@ export async function evaluateDealChanges(ctx, headers, { plannedLinks = [], wit
         closedSkipped.push(change);
         continue;
       }
-      const reasons = guardReasons(cfg, change);
+      const reasons = guardReasons(cfg, change, released);
       if (reasons.length) held.push({ ...change, reasons });
       else updates.set(dealId, change);
     }
@@ -198,6 +205,7 @@ export async function evaluateDealChanges(ctx, headers, { plannedLinks = [], wit
  *   run recently enough that the amount change counts as caused by it.
  * - forced: header IDs with a change held on an earlier run; they are looked
  *   at again whether or not their amount changed since.
+ * - released: held changes released on the admin page (see guardReasons).
  * - backfill: treat every header as changed (one-off catch-up; also what the
  *   "any_difference" trigger does on every run).
  * - plannedLinks: header -> deal associations a dry run would have created, so
@@ -209,7 +217,7 @@ export async function evaluateDealChanges(ctx, headers, { plannedLinks = [], wit
  * applied: deal IDs updated (or, in a dry run, that would be), evaluated:
  * header IDs whose change was looked at in this run }.
  */
-export async function syncDealAmounts(ctx, headers, { baseline = {}, recordOnly = new Set(), newLines = new Set(), forced = new Set(), backfill = false, plannedLinks = [], limit = null } = {}, stats = newDealAmountStats()) {
+export async function syncDealAmounts(ctx, headers, { baseline = {}, recordOnly = new Set(), newLines = new Set(), forced = new Set(), released = null, backfill = false, plannedLinks = [], limit = null } = {}, stats = newDealAmountStats()) {
   const { api, mapping } = ctx;
   const cfg = mapping.dealAmount;
   const headerObj = mapping.objects[cfg.header];
@@ -250,7 +258,7 @@ export async function syncDealAmounts(ctx, headers, { baseline = {}, recordOnly 
   if (qualifying.length === 0) return { baseline: nextBaseline, recheck, applied, evaluated };
   for (const header of qualifying) evaluated.add(header.id);
 
-  const { updates, held, closedSkipped } = await evaluateDealChanges(ctx, qualifying, { plannedLinks }, stats);
+  const { updates, held, closedSkipped } = await evaluateDealChanges(ctx, qualifying, { plannedLinks, released }, stats);
   stats.held.push(...held);
   stats.heldCount += held.length;
   for (const change of closedSkipped) if (stats.closedSkipped.length < MAX_CHANGE_ROWS) stats.closedSkipped.push(change);

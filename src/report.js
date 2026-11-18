@@ -72,7 +72,7 @@ function heldSection(d, dry) {
   if (d.held.length === 0) {
     lines.push('No deal amount change is held.');
   } else {
-    lines.push(`${d.held.length} deal amount change(s) ${dry ? 'would be' : 'are'} held. The deals were not changed. Each one is looked at again on every run and stays on this list until it is released in the mapping or no longer applies.`);
+    lines.push(`${d.held.length} deal amount change(s) ${dry ? 'would be' : 'are'} held. The deals were not changed. Each one is looked at again on every run and stays on this list until it is released, on the admin page or in the mapping, or no longer applies.`);
     lines.push('');
     lines.push(table(
       ['Deal ID', 'Quote header ID', 'Deal amount now', 'Quote amount (not applied)', 'Why held', 'Held since'],
@@ -84,8 +84,14 @@ function heldSection(d, dry) {
     }
   }
   lines.push('');
+  const lapsed = d.releasesLapsed || [];
+  if (lapsed.length) {
+    lines.push(`${lapsed.length} change(s) released on the admin page ${dry ? 'would stay' : 'stayed'} held: the quote amount is no longer the amount that was released, so the release ${dry ? 'would no longer apply' : 'no longer applies'}. Deal ID(s): ${lapsed.slice(0, MAX_REPORT_ROWS).map((hold) => hold.dealId).join(', ')}.`);
+    lines.push('');
+  }
+  const applied = (hold) => (hold.releasedOnPage ? 'released on the admin page' : 'the guard no longer holds it');
   const ended = [
-    ...(d.holdsReleased || []).map((hold) => [hold, dry ? 'would be applied: the guard no longer holds it' : 'applied: the guard no longer holds it']),
+    ...(d.holdsReleased || []).map((hold) => [hold, `${dry ? 'would be applied' : 'applied'}: ${applied(hold)}`]),
     ...(d.holdsNoLongerApply || []).map((hold) => [hold, dry ? 'would be closed: it no longer applies' : 'closed: it no longer applies']),
   ];
   if (ended.length) {
@@ -172,13 +178,14 @@ export function compactSummary(summary) {
     ...summary,
     rules: (summary.rules || []).map(({ unresolved, links, ...counts }) => counts),
     dealAmount: summary.dealAmount
-      ? (({ changes, failures, held, closedSkipped, holdsReleased, holdsNoLongerApply, projection, ...counts }) => ({
+      ? (({ changes, failures, held, closedSkipped, holdsReleased, holdsNoLongerApply, releasesLapsed, projection, ...counts }) => ({
         ...counts,
         closedSkipped: (closedSkipped || []).slice(0, 200),
         failures: (failures || []).slice(0, 20),
         held: (held || []).slice(0, 200),
         holdsReleased: (holdsReleased || []).slice(0, 200),
         holdsNoLongerApply: (holdsNoLongerApply || []).slice(0, 200),
+        releasesLapsed: (releasesLapsed || []).slice(0, 200),
         projection: projection ? (({ changes: rows, ...totals }) => totals)(projection) : null,
       }))(summary.dealAmount)
       : null,

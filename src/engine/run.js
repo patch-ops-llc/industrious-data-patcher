@@ -9,6 +9,7 @@ import {
   hasCompletedLiveRun,
   headerAmountCandidates,
   headersToRecheck,
+  lapseDealAmountReleases,
   getArrivalsSince,
   insertRun,
   markNewLines,
@@ -24,7 +25,7 @@ import {
 } from '../db/store.js';
 import { compactSummary, renderRunMarkdown } from '../report.js';
 import { newRuleStats, processRule } from './associate.js';
-import { newDealAmountStats, projectLinkedLineAmounts, syncDealAmounts } from './dealAmount.js';
+import { newDealAmountStats, projectLinkedLineAmounts, sameAmount, syncDealAmounts } from './dealAmount.js';
 import { linkHealth } from './health.js';
 import { ingestAll, objectsToIngest } from './ingest.js';
 
@@ -86,6 +87,8 @@ async function runDealAmounts(ctx, run, { touchedHeaderIds, headersWithNewLinks,
   // still held, applied (guard released) or closed as no longer applying.
   const openHolds = await openDealAmountHolds(db);
   const forced = new Set(openHolds.map((hold) => hold.headerId));
+  // Held changes someone released on the admin page: let through for the approved amount only.
+  const released = new Map(openHolds.filter((hold) => hold.releasedAt).map((hold) => [hold.dealId, { headerId: hold.headerId, amount: hold.releasedAmount }]));
 
   // The header amount can be a rollup that HubSpot recalculates after lines
   // change, so headers whose lines changed, and headers flagged by the
@@ -117,7 +120,7 @@ async function runDealAmounts(ctx, run, { touchedHeaderIds, headersWithNewLinks,
   const outcome = await syncDealAmounts(
     ctx,
     candidates.map((row) => ({ id: row.id, properties: row.properties })),
-    { baseline, recordOnly, newLines, forced, backfill, plannedLinks: plannedDealLinks, limit: run.limit },
+    { baseline, recordOnly, newLines, forced, released, backfill, plannedLinks: plannedDealLinks, limit: run.limit },
     stats,
   );
   stats.headersChecked = await countRecords(db, cfg.header);
@@ -130,19 +133,35 @@ async function runDealAmounts(ctx, run, { touchedHeaderIds, headersWithNewLinks,
   // An update that failed or was held back by the limit is tried again next
   // run; its hold stays open until the deal is really updated.
   const pending = new Set(outcome.recheck);
+  const appliedAmount = new Map(stats.changes.map((change) => [change.dealId, change.to]));
   const resolved = [];
+  // Releases made on the admin page that this run did not use: the release is
+  // for one amount, and it is dropped when the hold ends or goes on without it.
+  const unusedReleases = [];
   for (const hold of openHolds) {
-    if (heldNow.has(pairKey(hold))) continue;
+    if (heldNow.has(pairKey(hold))) {
+      // Released, and held all the same: the quote amount is no longer the one that was approved.
+      if (hold.releasedAt) {
+        stats.releasesLapsed.push(hold);
+        unusedReleases.push(hold.id);
+      }
+      continue;
+    }
     if (outcome.applied.has(hold.dealId)) {
+      const releasedOnPage = Boolean(hold.releasedAt)
+        && (!appliedAmount.has(hold.dealId) || sameAmount(appliedAmount.get(hold.dealId), hold.releasedAmount));
+      if (hold.releasedAt && !releasedOnPage) unusedReleases.push(hold.id);
       resolved.push({ id: hold.id, resolution: 'applied' });
-      stats.holdsReleased.push(hold);
+      stats.holdsReleased.push({ ...hold, releasedOnPage });
     } else if (!pending.has(hold.headerId)) {
+      if (hold.releasedAt) unusedReleases.push(hold.id);
       resolved.push({ id: hold.id, resolution: 'no_longer_applies' });
       stats.holdsNoLongerApply.push(hold);
     }
   }
 
   if (run.persist) {
+    await lapseDealAmountReleases(db, unusedReleases);
     await saveDealAmountHolds(db, { held: stats.held, resolved, runId: run.runId, now: run.startedAt });
     const again = new Set(outcome.recheck);
     const settleUntil = backlogSettleUntil(cfg, run.startedAt);
@@ -353,7 +372,9 @@ export async function executeRun(ctx, { mode = 'incremental', limit = null, deal
         stats.projection = await projectLinkedLineAmounts(ctx, { lineLinks, plannedDealLinks });
         stats.projection.linksTruncated = lineLinksTruncated;
       }
-      const { changes, failures, held, closedSkipped, holdsReleased, holdsNoLongerApply, projection, ...counts } = stats;
+      const { changes, failures, held, closedSkipped, holdsReleased, holdsNoLongerApply, releasesLapsed, projection, ...counts } = stats;
+      counts.releasedOnAdminPage = holdsReleased.filter((hold) => hold.releasedOnPage).length;
+      counts.releasesLapsed = releasesLapsed.length;
       counts.projected = projection ? { wouldUpdate: projection.wouldUpdate, held: projection.heldCount } : null;
       log.info('deal amounts processed', counts);
     }

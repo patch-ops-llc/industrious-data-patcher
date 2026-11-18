@@ -437,10 +437,14 @@ export async function saveBaselines(db, { entries, now }) {
 /** Changes still held for review, oldest first. */
 export async function openDealAmountHolds(db) {
   const { rows } = await db.query(
-    `SELECT id, deal_id, header_id, amount_before, amount_after, reasons, first_held_at, last_seen_at
+    `SELECT id, deal_id, header_id, amount_before, amount_after, reasons, first_held_at, last_seen_at, released_at, released_amount
      FROM deal_amount_holds WHERE resolved_at IS NULL ORDER BY first_held_at, id`,
   );
-  return rows.map((row) => ({
+  return rows.map(holdRow);
+}
+
+function holdRow(row) {
+  return {
     id: String(row.id),
     dealId: row.deal_id,
     headerId: row.header_id,
@@ -449,7 +453,49 @@ export async function openDealAmountHolds(db) {
     reasons: row.reasons,
     firstHeldAt: iso(row.first_held_at),
     lastSeenAt: iso(row.last_seen_at),
-  }));
+    // Set when the change was released on the admin page; the release is for releasedAmount only.
+    releasedAt: row.released_at ? iso(row.released_at) : null,
+    releasedAmount: row.released_at ? row.released_amount : null,
+  };
+}
+
+/**
+ * Releases held changes (admin page). items: [{ id, amount }], where amount is
+ * the quote amount the person saw. A hold is only released while it is still
+ * open, not released yet, and still for that amount. Returns the holds released.
+ */
+export async function releaseDealAmountHolds(db, { items, now }) {
+  if (items.length === 0) return [];
+  const { rows } = await db.query(
+    `UPDATE deal_amount_holds h SET released_at = $2::timestamptz, released_amount = h.amount_after
+     FROM jsonb_to_recordset($1::jsonb) AS x(id text, amount text)
+     WHERE h.id = x.id::bigint AND h.resolved_at IS NULL AND h.released_at IS NULL AND h.amount_after = x.amount
+     RETURNING h.id, h.deal_id, h.header_id, h.amount_before, h.amount_after, h.reasons, h.first_held_at, h.last_seen_at, h.released_at, h.released_amount`,
+    [JSON.stringify(items.map((item) => ({ id: String(item.id), amount: String(item.amount ?? '') }))), iso(now)],
+  );
+  return rows.map(holdRow);
+}
+
+/** Takes a release back, as long as no run has applied it. Returns the hold, or null when there was nothing to take back. */
+export async function cancelDealAmountRelease(db, id) {
+  const { rows } = await db.query(
+    `UPDATE deal_amount_holds SET released_at = NULL, released_amount = NULL
+     WHERE id = $1::bigint AND resolved_at IS NULL AND released_at IS NOT NULL
+     RETURNING id, deal_id, header_id, amount_before, amount_after, reasons, first_held_at, last_seen_at, released_at, released_amount`,
+    [String(id)],
+  );
+  return rows.length ? holdRow(rows[0]) : null;
+}
+
+/** A release that no longer matches the quote amount lapses: the change is held again. */
+export async function lapseDealAmountReleases(db, ids) {
+  for (const group of chunk([...ids], BULK)) {
+    await db.query(
+      `UPDATE deal_amount_holds SET released_at = NULL, released_amount = NULL
+       WHERE resolved_at IS NULL AND id::text = ANY(${ID_ARRAY(1)})`,
+      [idList(group)],
+    );
+  }
 }
 
 /**

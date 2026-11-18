@@ -244,6 +244,8 @@ test('staging database: migrations create every table once, are safe to repeat, 
   assert.equal((await db.query('SELECT count(*)::int AS n FROM admin_password')).rows[0].n, 0);
   // The schedule table (migration 005) starts empty too: RUN_INTERVAL_MINUTES applies until the schedule is saved on the admin page.
   assert.ok(applied.includes('005_schedule_settings.sql'));
+  assert.ok(applied.includes('006_deal_amount_release.sql'));
+  assert.deepEqual((await db.query(`SELECT released_at, released_amount FROM deal_amount_holds`)).rows, []);
   assert.equal((await db.query('SELECT count(*)::int AS n FROM schedule_settings')).rows[0].n, 0);
   await assert.rejects(db.query(`INSERT INTO schedule_settings (id, enabled, interval_minutes, updated_at) VALUES (2, true, 30, now())`));
   await assert.rejects(db.query(`INSERT INTO schedule_settings (id, enabled, interval_minutes, updated_at) VALUES (1, true, 0, now())`));
